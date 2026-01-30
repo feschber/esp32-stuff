@@ -12,6 +12,14 @@ pub(crate) fn save_wifi_credentials(ssid: &str, password: &str) -> anyhow::Resul
     Ok(())
 }
 
+pub(crate) fn clear_wifi_credentials() -> anyhow::Result<()> {
+    let nvs_part = EspDefaultNvsPartition::take().expect("failed to load nvs partition");
+    let mut namespace = EspNvs::new(nvs_part, WIFI_NS, true)?;
+    namespace.remove(SSID_KEY)?;
+    namespace.remove(PW_KEY)?;
+    Ok(())
+}
+
 pub(crate) fn load_wifi_credentials() -> anyhow::Result<Option<(String, String)>> {
     let nvs_part = EspDefaultNvsPartition::take().expect("failed to load nvs partition");
     let namespace = EspNvs::new(nvs_part, WIFI_NS, false)?;

@@ -1,3 +1,6 @@
+use crate::ap::provisioning_mode;
+
+mod ap;
 mod nvs;
 
 fn main() {
@@ -9,12 +12,16 @@ fn main() {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     match nvs::load_wifi_credentials() {
-        Ok(cred) => match cred {
-            Some((ssid, pw)) => log::info!("loaded credentials: ssid={ssid}, pw={pw}"),
-            None => todo!(),
-        },
-        Err(e) => log::warn!("failed to load wifi credentials: {e}"),
-    }
-
-    log::info!("Hello, world!");
+        Ok(Some(cred)) => {
+            let (ssid, pw) = cred;
+            log::info!("loaded credentials: ssid={ssid}, pw={pw}");
+        }
+        Ok(None) => {
+            log::warn!("wifi credentials not found!");
+        }
+        Err(e) => {
+            log::warn!("failed to load wifi credentials: {e}");
+        }
+    };
+    provisioning_mode();
 }
