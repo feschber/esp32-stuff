@@ -1,6 +1,8 @@
 use crate::ap::provisioning_mode;
 
 mod ap;
+mod dns;
+mod http;
 mod nvs;
 
 fn main() {
