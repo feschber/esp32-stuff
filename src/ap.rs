@@ -14,12 +14,15 @@ use esp_idf_svc::{
     },
 };
 use esp_idf_sys::{
-    self, esp, esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option, ESP_OK,
+    self, esp, esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
+    esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option, ESP_OK,
 };
+
+use crate::dns;
 
 const SSID: &'static str = "magic-esp-wifi";
 const WIFI_PW: &'static str = "magic-esp-wifi-pw";
-const CAPTIVE_PORTAL_URI: &'static str = "http://192.168.71.1\0";
+const CAPTIVE_PORTAL_URI: &'static str = "http://192.168.71.1/portal\0";
 
 pub(crate) fn provisioning_mode() {
     let modem = Peripherals::take().expect("peripherals").modem;
@@ -41,12 +44,13 @@ pub(crate) fn provisioning_mode() {
         ..NetifConfiguration::wifi_default_router()
     })
     .expect("netif");
+    assert!(!ap_netif.is_up().unwrap());
     esp!(unsafe {
         let captive_portal_uri = CStr::from_bytes_with_nul(CAPTIVE_PORTAL_URI.as_bytes()).unwrap();
         esp_netif_dhcps_option(
             ap_netif.handle(),
             esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
-            114,
+            esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
             captive_portal_uri.as_ptr() as *mut _,
             CAPTIVE_PORTAL_URI.len() as u32 - 1,
         )
@@ -56,6 +60,9 @@ pub(crate) fn provisioning_mode() {
     let wifi = EspWifi::wrap_all(wifi, sta_netif, ap_netif).expect("EspWifi");
     let mut wifi = BlockingWifi::wrap(wifi, event_loop).expect("blocking wifi");
     host_ap(&mut wifi);
+    std::thread::spawn(move || {
+        dns::dns_server(ap_ip).expect("dns failed");
+    });
     let server = crate::http::host_server().expect("http server");
     // event_loop.subscribe(handle_event);
     // FIXME

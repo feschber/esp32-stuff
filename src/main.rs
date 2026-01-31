@@ -1,5 +1,6 @@
-use crate::ap::provisioning_mode;
+#![feature(ip_as_octets)]
 
+use crate::ap::provisioning_mode;
 mod ap;
 mod dns;
 mod http;
