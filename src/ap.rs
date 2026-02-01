@@ -1,16 +1,20 @@
 use std::{
     ffi::{c_str, CStr},
     net::Ipv4Addr,
+    sync::{Arc, Mutex},
+    thread::sleep,
+    time::Duration,
 };
 
 use esp_idf_svc::{
-    hal::prelude::Peripherals,
+    hal::{adc::continuous, prelude::Peripherals},
     handle::RawHandle,
     ipv4::{self, Configuration, Mask, RouterConfiguration, Subnet},
     netif::{EspNetif, NetifConfiguration, NetifStack},
     nvs::EspDefaultNvsPartition,
     wifi::{
-        self, AccessPointConfiguration, BlockingWifi, ClientConfiguration, EspWifi, WifiDriver,
+        self, AccessPointConfiguration, AccessPointInfo, BlockingWifi, ClientConfiguration,
+        EspWifi, WifiDriver,
     },
 };
 use esp_idf_sys::{
@@ -60,10 +64,12 @@ pub(crate) fn provisioning_mode() {
     let wifi = EspWifi::wrap_all(wifi, sta_netif, ap_netif).expect("EspWifi");
     let mut wifi = BlockingWifi::wrap(wifi, event_loop).expect("blocking wifi");
     host_ap(&mut wifi);
+    let wifi_aps = Arc::new(Mutex::new(Vec::new()));
     std::thread::spawn(move || {
         dns::dns_server(ap_ip).expect("dns failed");
     });
-    let server = crate::http::host_server().expect("http server");
+    let server = crate::http::host_server(Arc::clone(&wifi_aps)).expect("http server");
+    wifi_scan(&mut wifi, Arc::clone(&wifi_aps));
     // event_loop.subscribe(handle_event);
     // FIXME
     core::mem::forget(wifi);
@@ -85,6 +91,24 @@ fn host_ap(wifi: &mut BlockingWifi<EspWifi<'_>>) {
     ))
     .expect("wifi configuration");
     wifi.start().expect("failed to start wifi");
+}
+
+fn wifi_scan(wifi: &mut BlockingWifi<EspWifi<'_>>, aps: Arc<Mutex<Vec<AccessPointInfo>>>) {
+    loop {
+        log::info!("scanning wifi networks");
+        let res = match wifi.scan() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("wifi scan failed: {e}");
+                continue;
+            }
+        };
+        for ap in &res {
+            log::info!("{ap:?}");
+        }
+        *aps.lock().unwrap() = res;
+        sleep(Duration::from_secs(10));
+    }
 }
 
 // fn handle_event(event: EspEvent) {
