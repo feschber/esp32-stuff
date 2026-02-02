@@ -1,0 +1,196 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Wi-Fi Setup</title>
+
+        <style>
+            body {
+                font-family: sans-serif;
+                margin: 0;
+                padding: 12px;
+                background: #fff;
+            }
+
+            h1 {
+                font-size: 18px;
+                margin-bottom: 10px;
+            }
+
+            .net {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 10px 6px;
+                border-bottom: 1px solid #ddd;
+                cursor: pointer;
+            }
+
+            .ssid {
+                font-size: 14px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                max-width: 70%;
+            }
+
+            /* Wi-Fi bars */
+            .bars {
+                display: flex;
+                align-items: flex-end;
+                gap: 2px;
+                height: 14px;
+            }
+
+            .bar {
+                width: 3px;
+                background: #ccc;
+            }
+
+            .bar.active {
+                background: #000;
+            }
+
+            .bar:nth-child(1) {
+                height: 4px;
+            }
+            .bar:nth-child(2) {
+                height: 7px;
+            }
+            .bar:nth-child(3) {
+                height: 10px;
+            }
+            .bar:nth-child(4) {
+                height: 13px;
+            }
+
+            #passwordBox {
+                margin-top: 12px;
+                display: none;
+            }
+
+            input,
+            button {
+                width: 100%;
+                padding: 8px;
+                margin-top: 6px;
+                font-size: 14px;
+            }
+
+            button {
+                border: 0;
+                background: #000;
+                color: #fff;
+            }
+
+            .status {
+                font-size: 13px;
+                margin-top: 8px;
+            }
+        </style>
+    </head>
+
+    <body>
+        <h1>Select Wi-Fi</h1>
+
+        <div id="networks"></div>
+
+        <div id="passwordBox">
+            <div id="selectedSsid"></div>
+            <input id="password" type="password" placeholder="Password" />
+            <button id="connect">Connect</button>
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <script>
+            let selectedSSID = null;
+
+            function barsFromDbm(dbm) {
+                if (dbm >= -50) return 4;
+                if (dbm >= -60) return 3;
+                if (dbm >= -70) return 2;
+                if (dbm >= -80) return 1;
+                return 0;
+            }
+
+            function createBars(level) {
+                const bars = document.createElement("div");
+                bars.className = "bars";
+
+                for (let i = 1; i <= 4; i++) {
+                    const bar = document.createElement("div");
+                    bar.className = "bar" + (i <= level ? " active" : "");
+                    bars.appendChild(bar);
+                }
+                return bars;
+            }
+
+            async function loadNetworks() {
+                try {
+                    const res = await fetch("/wifi-networks");
+                    const nets = await res.json();
+                    const list = document.getElementById("networks");
+                    list.innerHTML = "";
+
+                    nets.sort((a, b) => b.signal_strength - a.signal_strength);
+
+                    for (const n of nets) {
+                        const row = document.createElement("div");
+                        row.className = "net";
+
+                        const ssid = document.createElement("div");
+                        ssid.className = "ssid";
+                        ssid.textContent = n.ssid;
+
+                        const bars = createBars(barsFromDbm(n.signal_strength));
+
+                        row.appendChild(ssid);
+                        row.appendChild(bars);
+
+                        row.onclick = () => {
+                            selectedSSID = n.ssid;
+                            document.getElementById(
+                                "passwordBox",
+                            ).style.display = "block";
+                            document.getElementById(
+                                "selectedSsid",
+                            ).textContent = "Network: " + n.ssid;
+                        };
+
+                        list.appendChild(row);
+                    }
+                } catch {
+                    document.getElementById("status").textContent =
+                        "Failed to load networks";
+                }
+            }
+
+            document.getElementById("connect").onclick = async () => {
+                const password = document.getElementById("password").value;
+                document.getElementById("status").textContent = "Connecting…";
+
+                try {
+                    const res = await fetch("/wifi_credentials", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            ssid: selectedSSID,
+                            password,
+                        }),
+                    });
+
+                    if (!res.ok) throw 0;
+                    document.getElementById("status").textContent =
+                        "Credentials sent";
+                } catch {
+                    document.getElementById("status").textContent =
+                        "Connection failed";
+                }
+            };
+
+            loadNetworks();
+        </script>
+    </body>
+</html>

@@ -7,7 +7,7 @@ use std::{
 };
 
 use esp_idf_svc::{
-    hal::{adc::continuous, prelude::Peripherals},
+    hal::{adc::continuous, peripheral::Peripheral, prelude::Peripherals},
     handle::RawHandle,
     ipv4::{self, Configuration, Mask, RouterConfiguration, Subnet},
     netif::{EspNetif, NetifConfiguration, NetifStack},
@@ -22,14 +22,26 @@ use esp_idf_sys::{
     esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option, ESP_OK,
 };
 
-use crate::dns;
+use crate::{dns, oled};
 
 const SSID: &'static str = "magic-esp-wifi";
 const WIFI_PW: &'static str = "magic-esp-wifi-pw";
 const CAPTIVE_PORTAL_URI: &'static str = "http://192.168.71.1/portal\0";
 
 pub(crate) fn provisioning_mode() {
-    let modem = Peripherals::take().expect("peripherals").modem;
+    let mut peripherals = Peripherals::take().expect("peripherals");
+    let mut display = oled::setup_display(
+        &mut peripherals.pins.gpio5,
+        &mut peripherals.pins.gpio6,
+        &mut peripherals.i2c0,
+    )
+    .expect("display");
+    oled::render_qr_code(
+        format!("WIFI:T:WPA;S:{SSID};P:{WIFI_PW};;").as_str(),
+        &mut display,
+    )
+    .expect("render qr code");
+    let modem = &mut peripherals.modem;
     let event_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take().expect("event loop");
     let nvs = EspDefaultNvsPartition::take().expect("failed to load nvs partition");
     let wifi = WifiDriver::new(modem, event_loop.clone(), Some(nvs)).expect("wifi driver");

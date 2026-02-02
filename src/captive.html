@@ -21,6 +21,35 @@
     <body>
         <h1>Magic esp32 Setup</h1>
         <h2>Connect To A WiFi Network</h2>
+        <ol id="wifi-list"></ol>
+        <script type="text/javascript">
+            async function poll_networks() {
+                try {
+                    let list = document.getElementById("wifi-list");
+                    let resp = await fetch("/wifi-networks", {
+                        method: "GET",
+                    });
+                    let wifi_aps = JSON.parse(await resp.text());
+                    let html = wifi_aps
+                        .map(
+                            (e) =>
+                                "<li>" +
+                                e.ssid +
+                                " (" +
+                                e.signal_strength +
+                                "db)" +
+                                "</li>",
+                        )
+                        .join("\n");
+                    list.innerHTML = html;
+                    setTimeout(poll_networks, 2000);
+                } catch (error) {
+                    console.error(error);
+                    setTimeout(poll_networks, 2000);
+                }
+            }
+            poll_networks();
+        </script>
         <form
             id="the-form"
             action="/wifi_credentials"

@@ -5,6 +5,7 @@ mod ap;
 mod dns;
 mod http;
 mod nvs;
+mod oled;
 
 fn main() {
     // It is necessary to call this function once. Otherwise, some patches to the runtime

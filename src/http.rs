@@ -15,7 +15,7 @@ use esp_idf_sys::EspError;
 use serde::{Deserialize, Serialize};
 
 const STACK_SIZE: usize = 10240;
-const INDEX_HTML: &str = include_str!("captive.html");
+const INDEX_HTML: &str = include_str!("asdf.html");
 
 #[derive(Deserialize)]
 struct WifiFormData<'a> {
@@ -86,12 +86,17 @@ pub(crate) fn host_server<'a>(
             let mut resp = req.into_ok_response()?;
 
             write!(resp, "[")?;
-            for ap in wifi_aps.lock().unwrap().clone() {
+            let aps = wifi_aps.lock().unwrap().clone();
+            let len = aps.len();
+            for (i, ap) in aps.into_iter().enumerate() {
                 if let Ok(json) = serde_json::to_string(&WifiAdvert {
                     ssid: ap.ssid.as_str(),
                     signal_strength: ap.signal_strength,
                 }) {
-                    write!(resp, "{json},")?;
+                    write!(resp, "{json}")?;
+                    if i < len - 1 {
+                        write!(resp, ", ")?;
+                    }
                 } else {
                     resp.write_all("JSON error".as_bytes())?;
                 }

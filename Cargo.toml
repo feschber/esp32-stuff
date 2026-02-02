@@ -30,6 +30,9 @@ esp-idf-sys = "0.36.1"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 embedded-svc = "0.28.1"
+embedded-graphics = "0.8.1"
+ssd1306 = "0.10.0"
+qrcode = "0.14.1"
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
