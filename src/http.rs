@@ -1,17 +1,11 @@
-use std::{
-    sync::{Arc, Mutex},
-    thread::sleep,
-    time::Duration,
-};
+use std::sync::{Arc, Mutex};
 
 use embedded_svc::{
     http::{Headers, Method},
     io::{Read, Write},
-    ws::FrameType,
 };
 use esp_idf_svc::{http::server::EspHttpServer, wifi::AccessPointInfo};
 
-use esp_idf_sys::EspError;
 use serde::{Deserialize, Serialize};
 
 const STACK_SIZE: usize = 10240;

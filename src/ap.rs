@@ -19,7 +19,8 @@ use esp_idf_svc::{
 };
 use esp_idf_sys::{
     self, esp, esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
-    esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option, ESP_OK,
+    esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option, esp_wifi_set_ps,
+    wifi_ps_type_t_WIFI_PS_MIN_MODEM, wifi_ps_type_t_WIFI_PS_NONE, ESP_OK,
 };
 
 use crate::{dns, oled};
@@ -75,13 +76,16 @@ pub(crate) fn provisioning_mode() {
     let ap_ip = ap_netif.get_ip_info().expect("ip info").ip;
     let wifi = EspWifi::wrap_all(wifi, sta_netif, ap_netif).expect("EspWifi");
     let mut wifi = BlockingWifi::wrap(wifi, event_loop).expect("blocking wifi");
-    host_ap(&mut wifi);
+    log::info!("disabling wifi power save");
+    unsafe { esp!(esp_wifi_set_ps(wifi_ps_type_t_WIFI_PS_NONE)) }
+        .expect("failed to set powersaving");
+    start_wifi(&mut wifi);
     let wifi_aps = Arc::new(Mutex::new(Vec::new()));
+    wifi_scan(&mut wifi, Arc::clone(&wifi_aps));
     std::thread::spawn(move || {
         dns::dns_server(ap_ip).expect("dns failed");
     });
     let server = crate::http::host_server(Arc::clone(&wifi_aps)).expect("http server");
-    wifi_scan(&mut wifi, Arc::clone(&wifi_aps));
     // event_loop.subscribe(handle_event);
     // FIXME
     core::mem::forget(wifi);
@@ -89,15 +93,18 @@ pub(crate) fn provisioning_mode() {
     // unsafe { esp_idf_sys::esp_restart() }
 }
 
-fn host_ap(wifi: &mut BlockingWifi<EspWifi<'_>>) {
+fn start_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>) {
     wifi.set_configuration(&wifi::Configuration::Mixed(
-        ClientConfiguration::default(),
+        ClientConfiguration {
+            // channel: Some(6),
+            ..Default::default()
+        },
         AccessPointConfiguration {
             auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
             ssid: SSID.try_into().expect("ssid string"),
             password: WIFI_PW.try_into().expect("pw string"),
-            channel: 1,
-            max_connections: 4,
+            // channel: 6,
+            max_connections: 1,
             ..Default::default()
         },
     ))
@@ -112,6 +119,7 @@ fn wifi_scan(wifi: &mut BlockingWifi<EspWifi<'_>>, aps: Arc<Mutex<Vec<AccessPoin
             Ok(v) => v,
             Err(e) => {
                 log::warn!("wifi scan failed: {e}");
+                sleep(Duration::from_secs(10));
                 continue;
             }
         };
@@ -119,7 +127,7 @@ fn wifi_scan(wifi: &mut BlockingWifi<EspWifi<'_>>, aps: Arc<Mutex<Vec<AccessPoin
             log::info!("{ap:?}");
         }
         *aps.lock().unwrap() = res;
-        sleep(Duration::from_secs(10));
+        break;
     }
 }
 

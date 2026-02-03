@@ -1,15 +1,11 @@
 use anyhow::Result;
 
-use esp_idf_svc::hal::{
-    delay::FreeRtos, gpio::*, i2c::*, peripherals::Peripherals, units::FromValueType,
-};
+use esp_idf_svc::hal::{gpio::*, i2c::*, units::FromValueType};
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyleBuilder, Rectangle},
-    text::Text,
 };
 
 use qrcode::{self, QrCode};
