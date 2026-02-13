@@ -50,20 +50,6 @@ pub(crate) fn host_server<'a>(
 
         Ok(())
     })?;
-    // server.ws_handler("/ws/wifi-networks", move |ws| -> Result<(), EspError> {
-    //     loop {
-    //         let aps = wifi_aps.lock().unwrap().clone();
-    //         for ap in aps {
-    //             let json = serde_json::to_string(&WifiAdvert {
-    //                 ssid: ap.ssid.as_str(),
-    //                 signal_strength: ap.signal_strength,
-    //             })
-    //             .expect("serialization error");
-    //             ws.send(FrameType::Text(false), json.as_bytes())?;
-    //         }
-    //         sleep(Duration::from_secs(2));
-    //     }
-    // })?;
     server.fn_handler::<anyhow::Error, _>("/wifi-networks", Method::Get, {
         let wifi_aps = wifi_aps.clone();
         move |mut req| {

@@ -1,5 +1,6 @@
 use std::{
-    ffi::{c_str, CStr},
+    ffi::CStr,
+    i8,
     net::Ipv4Addr,
     sync::{Arc, Mutex},
     thread::sleep,
@@ -7,10 +8,10 @@ use std::{
 };
 
 use esp_idf_svc::{
-    hal::{adc::continuous, peripheral::Peripheral, prelude::Peripherals},
+    hal::prelude::Peripherals,
     handle::RawHandle,
-    ipv4::{self, Configuration, Mask, RouterConfiguration, Subnet},
-    netif::{EspNetif, NetifConfiguration, NetifStack},
+    ipv4::{self, Mask, RouterConfiguration, Subnet},
+    netif::{EspNetif, NetifConfiguration},
     nvs::EspDefaultNvsPartition,
     wifi::{
         self, AccessPointConfiguration, AccessPointInfo, BlockingWifi, ClientConfiguration,
@@ -18,16 +19,16 @@ use esp_idf_svc::{
     },
 };
 use esp_idf_sys::{
-    self, esp, esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
+    esp, esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
     esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option, esp_wifi_set_ps,
-    wifi_ps_type_t_WIFI_PS_MIN_MODEM, wifi_ps_type_t_WIFI_PS_NONE, ESP_OK,
+    wifi_ps_type_t_WIFI_PS_NONE,
 };
 
 use crate::{dns, oled};
 
 const SSID: &'static str = "magic-esp-wifi";
 const WIFI_PW: &'static str = "magic-esp-wifi-pw";
-const CAPTIVE_PORTAL_URI: &'static str = "http://192.168.71.1/portal\0";
+const CAPTIVE_PORTAL_URI: &'static [u8] = b"http://192.168.71.1/portal\0";
 
 pub(crate) fn provisioning_mode() {
     let mut peripherals = Peripherals::take().expect("peripherals");
@@ -63,7 +64,7 @@ pub(crate) fn provisioning_mode() {
     .expect("netif");
     assert!(!ap_netif.is_up().unwrap());
     esp!(unsafe {
-        let captive_portal_uri = CStr::from_bytes_with_nul(CAPTIVE_PORTAL_URI.as_bytes()).unwrap();
+        let captive_portal_uri = CStr::from_bytes_with_nul(CAPTIVE_PORTAL_URI).unwrap();
         esp_netif_dhcps_option(
             ap_netif.handle(),
             esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
@@ -104,7 +105,7 @@ fn start_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>) {
             ssid: SSID.try_into().expect("ssid string"),
             password: WIFI_PW.try_into().expect("pw string"),
             // channel: 6,
-            max_connections: 1,
+            max_connections: 2,
             ..Default::default()
         },
     ))
@@ -124,7 +125,43 @@ fn wifi_scan(wifi: &mut BlockingWifi<EspWifi<'_>>, aps: Arc<Mutex<Vec<AccessPoin
             }
         };
         for ap in &res {
-            log::info!("{ap:?}");
+            let ssid = ap.ssid.as_str();
+            let signal_strength = ap.signal_strength;
+            let bars = match ap.signal_strength {
+                -50..=i8::MAX => "****",
+                -60..-50 => "***.",
+                -70..-60 => "**..",
+                -80..-70 => "*...",
+                _ => "....",
+            };
+            let protos = ap
+                .protocols
+                .iter()
+                .map(|p| match p {
+                    wifi::Protocol::P802D11B => "b",
+                    wifi::Protocol::P802D11BG => "bg",
+                    wifi::Protocol::P802D11BGN => "bgn",
+                    wifi::Protocol::P802D11BGNLR => "bgnlr",
+                    wifi::Protocol::P802D11LR => "lr",
+                })
+                .collect::<Vec<_>>();
+            let protos = protos.join(",");
+            let chan = ap.channel;
+            let sec = match ap.auth_method {
+                Some(auth) => match auth {
+                    wifi::AuthMethod::None => "none",
+                    wifi::AuthMethod::WEP => "WEP",
+                    wifi::AuthMethod::WPA => "WPA",
+                    wifi::AuthMethod::WPA2Personal => "WPA2",
+                    wifi::AuthMethod::WPAWPA2Personal => "WPA / WPA2",
+                    wifi::AuthMethod::WPA2Enterprise => "WPA2 Enterprise",
+                    wifi::AuthMethod::WPA3Personal => "WPA3",
+                    wifi::AuthMethod::WPA2WPA3Personal => "WPA2 / WPA3",
+                    wifi::AuthMethod::WAPIPersonal => "WAPI",
+                },
+                None => "open",
+            };
+            log::info!("{ssid:<30} chan{chan:>2} {bars} ({signal_strength}dbm) {protos} {sec}");
         }
         *aps.lock().unwrap() = res;
         break;

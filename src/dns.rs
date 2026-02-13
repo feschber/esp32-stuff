@@ -2,10 +2,10 @@ use std::net::{Ipv4Addr, UdpSocket};
 
 const DNS_MAX_LEN: usize = 256;
 
-const OPCODE_MASK: u16 = 0x7800;
 const QR_FLAG: u16 = 1 << 15;
 const QD_TYPE_A: u16 = 1;
-const ANS_TTL_SEC: usize = 60;
+// use very low ttl for captive portal
+const ANS_TTL_SEC: usize = 10;
 
 /// DNS Header Packet
 #[derive(Debug, Clone, Copy)]
@@ -175,12 +175,6 @@ fn build_dns_response<'a>(mut req: &[u8], ip: Ipv4Addr, buf: &'a mut [u8]) -> Op
     }
 
     let header = DnsHeader::from_bytes(&mut req)?;
-    log::info!("dns query: {header:?}");
-
-    if header.flags & OPCODE_MASK != 0 {
-        log::warn!("dns: non standard query");
-        return None;
-    }
 
     let mut response_header = header;
     response_header.flags |= QR_FLAG;
@@ -200,7 +194,6 @@ fn build_dns_response<'a>(mut req: &[u8], ip: Ipv4Addr, buf: &'a mut [u8]) -> Op
         }
         total
     };
-    log::info!("req len: {resp_len}");
     let reply_len = size_of::<DnsHeader>()
         + resp_len
         + response_header.an_count as usize * size_of::<DnsAnswer>();
