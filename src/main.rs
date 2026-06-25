@@ -1,11 +1,27 @@
 #![feature(ip_as_octets)]
 
-use crate::ap::provisioning_mode;
 mod ap;
 mod dns;
+mod ft6336;
 mod http;
 mod nvs;
 mod oled;
+mod paper;
+mod wifi;
+
+enum Mode {
+    Provisioning,
+    Main,
+}
+
+impl Mode {
+    fn run(self) {
+        match self {
+            Mode::Provisioning => ap::provisioning_mode(),
+            Mode::Main => paper::run(),
+        }
+    }
+}
 
 fn main() {
     // It is necessary to call this function once. Otherwise, some patches to the runtime
@@ -15,7 +31,7 @@ fn main() {
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    match nvs::load_wifi_credentials() {
+    let mode = match nvs::load_wifi_credentials() {
         Ok(Some(cred)) => {
             let (ssid, pw) = cred;
             log::info!("loaded credentials: ssid={ssid}, pw={pw}");
@@ -26,6 +42,6 @@ fn main() {
         Err(e) => {
             log::warn!("failed to load wifi credentials: {e}");
         }
+        provisioning_mode();
     };
-    provisioning_mode();
 }

@@ -111,7 +111,8 @@ impl DnsAnswer {
 
 pub(crate) fn dns_server(ip: Ipv4Addr) -> anyhow::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:53")?;
-    let mut req_buf = [0u8; 128];
+    let mut req_buf = vec![0u8; 128];
+    let mut resp_buf = vec![0u8; DNS_MAX_LEN];
     loop {
         let (len, src) = match socket.recv_from(&mut req_buf) {
             Ok((0, _)) => {
@@ -125,7 +126,6 @@ pub(crate) fn dns_server(ip: Ipv4Addr) -> anyhow::Result<()> {
             }
         };
         let req = &req_buf[..len];
-        let mut resp_buf = vec![0u8; DNS_MAX_LEN];
         if let Some(resp) = build_dns_response(req, ip, &mut resp_buf) {
             if let Err(e) = socket.send_to(&resp, src) {
                 log::warn!("dns send_to(): {e}");
@@ -168,6 +168,9 @@ fn parse_dns_name<'a>(req: &mut &[u8], dst: &'a mut [u8]) -> Option<(usize, &'a 
 }
 
 fn build_dns_response<'a>(mut req: &[u8], ip: Ipv4Addr, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    for b in buf.iter_mut() {
+        *b = 0u8;
+    }
     let req_len = req.len();
     if req_len > buf.len() {
         log::warn!("dns: request too long, skipping");

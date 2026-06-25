@@ -43,6 +43,7 @@ pub(crate) fn host_server<'a>(
         let mut resp = req.into_ok_response()?;
 
         if let Ok(form) = serde_json::from_slice::<WifiFormData>(&buf) {
+            log::info!("Wifi Credentials: {}, {}", form.ssid, form.password);
             write!(resp, "WIFI: {}, {}", form.ssid, form.password)?;
         } else {
             resp.write_all("JSON error".as_bytes())?;
@@ -82,6 +83,7 @@ pub(crate) fn host_server<'a>(
                 }
             }
             write!(resp, "]")?;
+            resp.flush()?;
 
             Ok(())
         }
