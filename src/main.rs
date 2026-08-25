@@ -35,13 +35,16 @@ fn main() {
         Ok(Some(cred)) => {
             let (ssid, pw) = cred;
             log::info!("loaded credentials: ssid={ssid}, pw={pw}");
+            Mode::Main
         }
         Ok(None) => {
             log::warn!("wifi credentials not found!");
+            Mode::Provisioning
         }
         Err(e) => {
             log::warn!("failed to load wifi credentials: {e}");
+            Mode::Provisioning
         }
-        provisioning_mode();
     };
+    mode.run();
 }

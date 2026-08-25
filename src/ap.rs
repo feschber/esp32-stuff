@@ -10,19 +10,11 @@ use std::{
 use esp_idf_hal::{cpu::Core::Core1, delay::FreeRtos, peripheral::Peripheral};
 use esp_idf_svc::{
     hal::prelude::Peripherals,
-    handle::RawHandle,
-    ipv4::{self, Mask, RouterConfiguration, Subnet},
-    netif::{EspNetif, NetifConfiguration},
     nvs::EspDefaultNvsPartition,
     wifi::{
         self, AccessPointConfiguration, AccessPointInfo, AuthMethod::WPA2Personal, BlockingWifi,
         ClientConfiguration, EspWifi, WifiDriver,
     },
-};
-use esp_idf_sys::{
-    esp, esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
-    esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option, esp_wifi_set_ps,
-    wifi_ps_type_t_WIFI_PS_NONE, StaticTask_t,
 };
 
 use crate::{
@@ -58,23 +50,12 @@ pub(crate) fn provisioning_mode() {
     let modem = peripherals.modem.into_ref();
     let event_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take().expect("event loop");
     let nvs = EspDefaultNvsPartition::take().expect("failed to load nvs partition");
-    let wifi = crate::wifi::access_point(modem, event_loop.clone(), Some(nvs))
+    let (mut wifi, ap_ip) = crate::wifi::access_point(modem, event_loop.clone(), Some(nvs))
         .expect("failed to create wifi");
     crate::wifi::start_wifi(&mut wifi);
     let wifi_aps = Arc::new(Mutex::new(Vec::new()));
     wifi_scan(&mut wifi, Arc::clone(&wifi_aps));
 
-    esp!(unsafe {
-        let captive_portal_uri = CStr::from_bytes_with_nul(CAPTIVE_PORTAL_URI).unwrap();
-        esp_netif_dhcps_option(
-            ap_netif.handle(),
-            esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
-            esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
-            captive_portal_uri.as_ptr() as *mut _,
-            CAPTIVE_PORTAL_URI.len() as u32 - 1,
-        )
-    })
-    .expect("set dhcps option");
     #[derive(Clone, Copy)]
     struct DnsCtx {
         ap_ip: Ipv4Addr,
@@ -93,7 +74,7 @@ pub(crate) fn provisioning_mode() {
         dns::dns_server(ap_ip).expect("dns failed");
     });
     std::thread::spawn(move || loop {
-        touch.poll();
+        // touch.poll();
         FreeRtos::delay_ms(10);
     });
 
