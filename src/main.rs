@@ -3,6 +3,7 @@
 mod ap;
 mod dns;
 mod ft6336;
+mod gdeq0426t82;
 mod http;
 mod nvs;
 mod oled;
@@ -46,5 +47,6 @@ fn main() {
             Mode::Provisioning
         }
     };
-    mode.run();
+    paper::run();
+    // mode.run();
 }
