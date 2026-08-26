@@ -26,6 +26,10 @@ use crate::{
     gdeq0426t82::{Bank, Epd, FrameBuffer, Refresh, SCREEN_HEIGHT, SCREEN_WIDTH},
 };
 
+/// Comfortably faster than the controller's own scan period, so no report is
+/// missed. Needs CONFIG_FREERTOS_HZ=1000 to mean anything below 10ms.
+const POLL_INTERVAL_MS: u32 = 5;
+
 // Portrait layout, 480 wide by 800 tall.
 const BUTTON_SIZE: Size = Size::new(120, 120);
 const MINUS_AT: Point = Point::new(60, 560);
@@ -117,7 +121,10 @@ fn poll_touch<INT: InputPin>(
         };
 
         // Act on the moment a finger lands, not on every scan while it rests
-        // there, otherwise holding a button runs the counter away.
+        // there, otherwise holding a button runs the counter away. Polling well
+        // inside the controller's scan period makes this edge dependable: a tap
+        // or a gap between taps would have to be under ~14ms to slip past, and
+        // a finger cannot move that fast.
         let is_down = !touches.is_empty();
         let pressed = is_down && !was_down;
         was_down = is_down;
@@ -136,7 +143,7 @@ fn poll_touch<INT: InputPin>(
                 }
             }
         }
-        FreeRtos::delay_ms(20);
+        FreeRtos::delay_ms(POLL_INTERVAL_MS);
     }
 }
 
