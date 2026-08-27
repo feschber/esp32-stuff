@@ -12,11 +12,7 @@
 //! implemented, because on this panel it measured *slower* than a normal full
 //! refresh (1949ms against 1677ms) while leaving the image visibly under-driven.
 
-use embedded_graphics::{
-    pixelcolor::BinaryColor,
-    prelude::*,
-    primitives::Rectangle,
-};
+use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::Rectangle};
 use esp_idf_svc::hal::{
     delay::{Ets, FreeRtos},
     gpio::*,

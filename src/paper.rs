@@ -75,12 +75,10 @@ fn try_run() -> anyhow::Result<()> {
     // ~600ms, and taps that land in that window would otherwise be dropped.
     let counter = Arc::new(AtomicU8::new(counter));
     let (changes, change) = mpsc::channel();
-    thread::Builder::new()
-        .stack_size(4096)
-        .spawn({
-            let counter = Arc::clone(&counter);
-            move || poll_touch(touch, &counter, &changes)
-        })?;
+    thread::Builder::new().stack_size(4096).spawn({
+        let counter = Arc::clone(&counter);
+        move || poll_touch(touch, &counter, &changes)
+    })?;
 
     let mut shown = 0;
     loop {
@@ -189,13 +187,8 @@ fn draw_ui(frame: &mut FrameBuffer, counter: u8) {
     let _ = counter_box.into_styled(outline).draw(frame);
     let digit = [counter + b'0'];
     let digit = core::str::from_utf8(&digit).unwrap_or("?");
-    let _ = Text::with_alignment(
-        digit,
-        center_of(counter_box),
-        label,
-        Alignment::Center,
-    )
-    .draw(frame);
+    let _ =
+        Text::with_alignment(digit, center_of(counter_box), label, Alignment::Center).draw(frame);
 
     let _ = Text::with_alignment(
         "tap a button",
@@ -209,5 +202,8 @@ fn draw_ui(frame: &mut FrameBuffer, counter: u8) {
 /// Centre of `rect`, nudged so that a single line of text sits on its middle.
 fn center_of(rect: Rectangle) -> Point {
     let center = rect.center();
-    Point::new(center.x, center.y + FONT_10X20.character_size.height as i32 / 3)
+    Point::new(
+        center.x,
+        center.y + FONT_10X20.character_size.height as i32 / 3,
+    )
 }
