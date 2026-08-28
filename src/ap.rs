@@ -42,11 +42,14 @@ pub(crate) fn provisioning_mode() {
     //     &mut peripherals.i2c0,
     // )
     // .expect("display");
-    // oled::render_qr_code(
+    // qr::QrImage::fit(
     //     format!("WIFI:T:WPA;S:{SSID};P:{WIFI_PW};;").as_str(),
-    //     &mut display,
+    //     display.bounding_box(),
     // )
-    // .expect("render qr code");
+    // .expect("encode qr code")
+    // .draw(&mut display)
+    // .expect("draw qr code");
+    // display.flush().expect("flush");
     let modem = peripherals.modem.into_ref();
     let event_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take().expect("event loop");
     let nvs = EspDefaultNvsPartition::take().expect("failed to load nvs partition");

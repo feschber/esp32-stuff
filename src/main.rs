@@ -8,6 +8,7 @@ mod http;
 mod nvs;
 mod oled;
 mod paper;
+mod qr;
 mod wifi;
 
 enum Mode {

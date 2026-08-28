@@ -10,7 +10,7 @@ use embedded_graphics::{
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
-    text::{Alignment, Text},
+    text::{Alignment, LineHeight, Text, TextStyleBuilder},
 };
 use esp_idf_svc::hal::{delay::FreeRtos, gpio::InputPin, prelude::Peripherals};
 use std::{
@@ -24,17 +24,26 @@ use std::{
 use crate::{
     ft6336::{Ft6336, Touch},
     gdeq0426t82::{Bank, Epd, FrameBuffer, Refresh, SCREEN_HEIGHT, SCREEN_WIDTH},
+    qr::QrImage,
 };
 
 /// Comfortably faster than the controller's own scan period, so no report is
 /// missed. Needs CONFIG_FREERTOS_HZ=1000 to mean anything below 10ms.
 const POLL_INTERVAL_MS: u32 = 5;
 
+/// Whatever the code should carry. Encoded once at startup rather than per
+/// redraw, and the pixels come out identical every time, so a partial refresh
+/// diffs it away to nothing.
+const QR_PAYLOAD: &str = "https://www.good-display.com/product/457.html";
+
 // Portrait layout, 480 wide by 800 tall.
+const TITLE_Y: i32 = 60;
+const QR_AT: Point = Point::new(120, 90);
+const QR_SIZE: Size = Size::new(240, 240);
 const BUTTON_SIZE: Size = Size::new(120, 120);
 const MINUS_AT: Point = Point::new(60, 560);
 const PLUS_AT: Point = Point::new(300, 560);
-const COUNTER_AT: Point = Point::new(160, 260);
+const COUNTER_AT: Point = Point::new(160, 360);
 const COUNTER_SIZE: Size = Size::new(160, 160);
 
 pub(crate) fn run() {
@@ -66,8 +75,9 @@ fn try_run() -> anyhow::Result<()> {
     log::info!("cleared in {}ms", epd.refresh(Refresh::Full)?);
 
     let counter: u8 = 0;
+    let qr = QrImage::fit(QR_PAYLOAD, Rectangle::new(QR_AT, QR_SIZE))?;
     let mut frame = FrameBuffer::new();
-    draw_ui(&mut frame, counter);
+    draw_ui(&mut frame, counter, &qr);
     frame.flush(&mut epd, Bank::Both)?;
     log::info!("base image in {}ms", epd.refresh(Refresh::Full)?);
 
@@ -94,7 +104,7 @@ fn try_run() -> anyhow::Result<()> {
         if value == shown {
             continue;
         }
-        draw_ui(&mut frame, value);
+        draw_ui(&mut frame, value, &qr);
         frame.flush(&mut epd, Bank::Current)?;
         log::info!("counter {value} in {}ms", epd.refresh(Refresh::Partial)?);
         shown = value;
@@ -162,20 +172,26 @@ fn button_at(point: Point) -> Option<i8> {
     }
 }
 
-fn draw_ui(frame: &mut FrameBuffer, counter: u8) {
+fn draw_ui(frame: &mut FrameBuffer, counter: u8, qr: &QrImage) {
     let outline = PrimitiveStyle::with_stroke(BinaryColor::On, 3);
     let label = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
 
     frame.clear_white();
 
     // `FrameBuffer`'s draw error is Infallible, so none of these can fail.
-    let _ = Text::with_alignment(
+    let text_style = TextStyleBuilder::new()
+        .line_height(LineHeight::Pixels(50))
+        .alignment(Alignment::Center)
+        .build();
+    let _ = Text::with_text_style(
         "GDEQ0426T82 + FT6336U",
-        Point::new(SCREEN_WIDTH as i32 / 2, 100),
+        Point::new(SCREEN_WIDTH as i32 / 2, TITLE_Y),
         label,
-        Alignment::Center,
+        text_style,
     )
     .draw(frame);
+
+    let _ = qr.draw(frame);
 
     for (at, text) in [(MINUS_AT, "-"), (PLUS_AT, "+")] {
         let button = Rectangle::new(at, BUTTON_SIZE);
@@ -192,7 +208,7 @@ fn draw_ui(frame: &mut FrameBuffer, counter: u8) {
 
     let _ = Text::with_alignment(
         "tap a button",
-        Point::new(SCREEN_WIDTH as i32 / 2, SCREEN_HEIGHT as i32 - 80),
+        Point::new(SCREEN_WIDTH as i32 / 2, SCREEN_HEIGHT as i32 - 60),
         label,
         Alignment::Center,
     )
