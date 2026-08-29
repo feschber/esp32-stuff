@@ -1,12 +1,18 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc::Sender, Arc, Mutex};
 
 use embedded_svc::{
     http::{Headers, Method},
     io::{Read, Write},
 };
-use esp_idf_svc::{http::server::EspHttpServer, wifi::AccessPointInfo};
+use esp_idf_svc::{
+    http::server::EspHttpServer,
+    nvs::{EspNvsPartition, NvsDefault},
+    wifi::AccessPointInfo,
+};
 
 use serde::{Deserialize, Serialize};
+
+use crate::nvs;
 
 const STACK_SIZE: usize = 10240;
 const INDEX_HTML: &str = include_str!("asdf.html");
@@ -27,9 +33,10 @@ const MAX_REQ_LEN: usize = 128;
 
 pub(crate) fn host_server<'a>(
     wifi_aps: Arc<Mutex<Vec<AccessPointInfo>>>,
+    credentials_tx: Sender<(String, String)>,
 ) -> anyhow::Result<EspHttpServer<'a>> {
     let mut server = create_server()?;
-    server.fn_handler::<anyhow::Error, _>("/wifi_credentials", Method::Post, |mut req| {
+    server.fn_handler::<anyhow::Error, _>("/wifi_credentials", Method::Post, move |mut req| {
         let len = req.content_len().unwrap_or(0) as usize;
 
         if len > MAX_REQ_LEN {
@@ -45,6 +52,7 @@ pub(crate) fn host_server<'a>(
         if let Ok(form) = serde_json::from_slice::<WifiFormData>(&buf) {
             log::info!("Wifi Credentials: {}, {}", form.ssid, form.password);
             write!(resp, "WIFI: {}, {}", form.ssid, form.password)?;
+            credentials_tx.send((form.ssid.to_string(), form.password.to_string()))?;
         } else {
             resp.write_all("JSON error".as_bytes())?;
         }

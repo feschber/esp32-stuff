@@ -1,28 +1,38 @@
+//! Credential storage in the default NVS partition.
+//!
+//! The partition is a process-wide singleton: `EspDefaultNvsPartition::take()`
+//! returns `ESP_ERR_INVALID_STATE` while a handle is alive, and the WiFi driver
+//! holds one for as long as it runs. So these take a borrow of the caller's
+//! handle and clone it (it is an `Arc` inside) instead of taking their own.
+
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsPartitionId};
 
 const WIFI_NS: &'static str = "wifi";
 const SSID_KEY: &'static str = "ssid";
 const PW_KEY: &'static str = "password";
 
-pub(crate) fn save_wifi_credentials(ssid: &str, password: &str) -> anyhow::Result<()> {
-    let nvs_part = EspDefaultNvsPartition::take().expect("failed to load nvs partition");
-    let mut namespace = EspNvs::new(nvs_part, WIFI_NS, true)?;
+pub(crate) fn save_wifi_credentials(
+    partition: &EspDefaultNvsPartition,
+    ssid: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    let mut namespace = EspNvs::new(partition.clone(), WIFI_NS, true)?;
     namespace.set_raw(SSID_KEY, ssid.as_bytes())?;
     namespace.set_raw(PW_KEY, password.as_bytes())?;
     Ok(())
 }
 
-pub(crate) fn clear_wifi_credentials() -> anyhow::Result<()> {
-    let nvs_part = EspDefaultNvsPartition::take().expect("failed to load nvs partition");
-    let mut namespace = EspNvs::new(nvs_part, WIFI_NS, true)?;
+pub(crate) fn clear_wifi_credentials(partition: &EspDefaultNvsPartition) -> anyhow::Result<()> {
+    let mut namespace = EspNvs::new(partition.clone(), WIFI_NS, true)?;
     namespace.remove(SSID_KEY)?;
     namespace.remove(PW_KEY)?;
     Ok(())
 }
 
-pub(crate) fn load_wifi_credentials() -> anyhow::Result<Option<(String, String)>> {
-    let nvs_part = EspDefaultNvsPartition::take().expect("failed to load nvs partition");
-    let namespace = EspNvs::new(nvs_part, WIFI_NS, false)?;
+pub(crate) fn load_wifi_credentials(
+    partition: &EspDefaultNvsPartition,
+) -> anyhow::Result<Option<(String, String)>> {
+    let namespace = EspNvs::new(partition.clone(), WIFI_NS, false)?;
     let ssid = read_to_string(&namespace, SSID_KEY)?;
     let password = read_to_string(&namespace, PW_KEY)?;
     match (ssid, password) {

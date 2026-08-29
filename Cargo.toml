@@ -19,6 +19,7 @@ opt-level = "z"
 
 [features]
 default = []
+oled = []
 
 experimental = ["esp-idf-svc/experimental"]
 

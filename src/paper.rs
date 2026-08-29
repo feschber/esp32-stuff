@@ -6,10 +6,11 @@
 //! touch coordinates are the same thing.
 
 use embedded_graphics::{
+    framebuffer,
     mono_font::{ascii::FONT_10X20, MonoTextStyle},
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Line, PrimitiveStyle, Rectangle},
     text::{Alignment, LineHeight, Text, TextStyleBuilder},
 };
 use esp_idf_svc::hal::{delay::FreeRtos, gpio::InputPin, prelude::Peripherals};
@@ -75,9 +76,8 @@ fn try_run() -> anyhow::Result<()> {
     log::info!("cleared in {}ms", epd.refresh(Refresh::Full)?);
 
     let counter: u8 = 0;
-    let qr = QrImage::fit(QR_PAYLOAD, Rectangle::new(QR_AT, QR_SIZE))?;
     let mut frame = FrameBuffer::new();
-    draw_ui(&mut frame, counter, &qr);
+    // draw_ui(&mut frame, counter, &qr);
     frame.flush(&mut epd, Bank::Both)?;
     log::info!("base image in {}ms", epd.refresh(Refresh::Full)?);
 
@@ -90,25 +90,49 @@ fn try_run() -> anyhow::Result<()> {
         move || poll_touch(touch, &counter, &changes)
     })?;
 
-    let mut shown = 0;
+    let mut prev: Option<Point> = None;
     loop {
         // Block until something changed, then swallow everything else that has
         // queued up: the panel can only ever show the newest value, so a burst
         // of taps during a refresh collapses into one redraw.
-        if change.recv().is_err() {
-            break Ok(());
+        match change.recv() {
+            Ok((point, pressed, released)) => {
+                draw_next(&mut prev, point, pressed, released, &mut frame);
+            }
+            Err(_) => {}
         }
-        while change.try_recv().is_ok() {}
+        while let Ok((point, pressed, released)) = change.try_recv() {
+            draw_next(&mut prev, point, pressed, released, &mut frame);
+        }
 
-        let value = counter.load(Ordering::Relaxed);
-        if value == shown {
-            continue;
-        }
-        draw_ui(&mut frame, value, &qr);
+        // draw_ui(&mut frame, value, &qr);
+        log::info!("redrawing");
         frame.flush(&mut epd, Bank::Current)?;
-        log::info!("counter {value} in {}ms", epd.refresh(Refresh::Partial)?);
-        shown = value;
+        epd.refresh(Refresh::Partial)?;
     }
+}
+
+fn draw_next(
+    prev: &mut Option<Point>,
+    point: Option<Point>,
+    pressed: bool,
+    released: bool,
+    frame: &mut FrameBuffer,
+) {
+    // log::info!("drawing at {:?}", point);
+    if let Some(prev) = prev {
+        if let Some(point) = point {
+            Line::new(*prev, point)
+                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
+                .draw(frame)
+                .ok();
+        }
+    } else if let Some(point) = point {
+        embedded_graphics::Pixel(point, BinaryColor::On)
+            .draw(frame)
+            .ok();
+    }
+    *prev = point;
 }
 
 /// Polls the controller and folds button presses into `counter`, waking the
@@ -116,7 +140,7 @@ fn try_run() -> anyhow::Result<()> {
 fn poll_touch<INT: InputPin>(
     mut touch: Ft6336<'static, INT>,
     counter: &AtomicU8,
-    changes: &mpsc::Sender<()>,
+    changes: &mpsc::Sender<(Option<Point>, bool, bool)>,
 ) {
     let mut was_down = false;
     loop {
@@ -135,20 +159,17 @@ fn poll_touch<INT: InputPin>(
         // a finger cannot move that fast.
         let is_down = !touches.is_empty();
         let pressed = is_down && !was_down;
+        let released = !is_down && was_down;
         was_down = is_down;
 
-        if pressed {
-            let point = screen_point(&touches[0]);
-            log::info!("touch at {point:?}");
-            if let Some(step) = button_at(point) {
-                counter
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                        Some((value as i8 + step).rem_euclid(10) as u8)
-                    })
-                    .ok();
-                if changes.send(()).is_err() {
-                    return; // render loop is gone
-                }
+        let point = if is_down {
+            Some(screen_point(&touches[0]))
+        } else {
+            None
+        };
+        if point.is_some() || released {
+            if changes.send((point, pressed, released)).is_err() {
+                return; // render loop is gone
             }
         }
         FreeRtos::delay_ms(POLL_INTERVAL_MS);
