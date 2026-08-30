@@ -14,6 +14,9 @@ use qrcode::{EcLevel, QrCode};
 /// Blank modules the spec requires around a code for scanners to lock onto it.
 const QUIET_ZONE: u32 = 4;
 
+/// Not currently drawn by the demo -- the canvas is bare. Kept because it is
+/// display-agnostic and cheap to wire back in.
+#[allow(dead_code)]
 pub struct QrImage {
     /// Row-major, `width` entries per row; true is a dark module.
     modules: Vec<bool>,
@@ -23,6 +26,7 @@ pub struct QrImage {
     top_left: Point,
 }
 
+#[allow(dead_code)]
 impl QrImage {
     /// Encodes `data` at the largest whole-pixel module size that fits `area`,
     /// centred within it, quiet zone included.

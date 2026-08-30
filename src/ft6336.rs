@@ -29,7 +29,7 @@ const CHIP_ID_FT6336U: u8 = 0x64;
 /// How hard a touch has to be, and how often the controller scans while a
 /// finger is down (in ms). Both are the values the vendor driver writes.
 const TOUCH_THRESHOLD: u8 = 22;
-const SCAN_PERIOD_MS: u8 = 14;
+const SCAN_PERIOD_MS: u8 = 5;
 
 #[repr(u8)]
 #[derive(Clone, Copy)]

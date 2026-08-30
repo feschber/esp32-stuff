@@ -61,6 +61,7 @@ enum Cmd {
     UpdateControl2 = 0x22,
     WriteRamCurrent = 0x24,
     WriteRamPrevious = 0x26,
+    WriteLut = 0x32,
     WriteVcom = 0x2C,
     BorderWaveform = 0x3C,
     RamXRange = 0x44,
@@ -76,8 +77,12 @@ mod seq {
     pub const ENABLE_CLOCK: u8 = 0x80;
     pub const ENABLE_ANALOG: u8 = 0x40;
     pub const LOAD_TEMPERATURE: u8 = 0x20;
-    pub const LOAD_LUT_MODE_1: u8 = 0x10;
-    pub const LOAD_LUT_MODE_2: u8 = 0x08;
+    pub const LOAD_LUT: u8 = 0x10;
+    /// Modifier, not a step of its own: it switches whichever of the load-LUT
+    /// and display steps are present from Display Mode 1 to the differential
+    /// Display Mode 2. The datasheet's own table for 0x22 spells this out --
+    /// 0xC7 is "display with Mode 1", 0xCF the same with Mode 2.
+    pub const MODE_2: u8 = 0x08;
     pub const DISPLAY: u8 = 0x04;
     pub const DISABLE_ANALOG: u8 = 0x02;
     pub const DISABLE_CLOCK: u8 = 0x01;
@@ -95,14 +100,33 @@ pub enum Bank {
     Both,
 }
 
+/// Phases pack two bits each into a waveform LUT byte, phase A in the top pair.
+/// Levels: 00 VSS, 01 VSH1, 10 VSL, 11 VSH2.
+///
+/// VSH1 drives a pixel black and VSL drives it white. The vendor's tables look
+/// like the opposite at a glance because a full-refresh waveform opens by
+/// pushing the pixel to the far extreme and only settles on the target in its
+/// last phases -- their "driving Black" LUT starts on VSL but ends on VSH1.
+///
+/// Measured: the panel runs the LUT at
+/// 19.65ms per frame, so a refresh costs `frames * 19.65ms`, plus 218ms if the
+/// rails have to be raised and dropped around it.
+const PHASE_VSH1: u8 = 0b01 << 6;
+const PHASE_VSL: u8 = 0b10 << 6;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Refresh {
     /// Flashes the whole panel. Slow, but the only way to clear the ghosting
     /// left behind by partial refreshes.
     Full,
-    /// Redraws only the pixels that differ from the previous image, without
-    /// flashing. Leaves ghosting behind, so run a full refresh now and then.
+    /// Redraws only the pixels that differ from the previous image, using the
+    /// waveform from OTP. Slower than [`Refresh::PartialFast`], but its
+    /// oscillating waveform is DC balanced, so residue stays clearable.
     Partial,
+    /// As [`Refresh::Partial`], but never reloads the waveform, so it uses
+    /// whatever [`Epd::load_fast_lut`] last wrote instead of the one in OTP.
+    #[allow(dead_code)]
+    PartialFast,
 }
 
 pub struct Epd<'d> {
@@ -111,6 +135,11 @@ pub struct Epd<'d> {
     dc: PinDriver<'d, AnyOutputPin, Output>,
     rst: PinDriver<'d, AnyOutputPin, Output>,
     busy: PinDriver<'d, AnyInputPin, Input>,
+    /// Set while the panel is powered up and still holding the differential
+    /// waveform, which lets the next partial refresh skip straight to the
+    /// display phase. Raising the analog rails again costs ~81ms, and loading
+    /// the waveform another ~1ms, so a burst of updates should only pay it once.
+    primed: bool,
 }
 
 impl<'d> Epd<'d> {
@@ -149,6 +178,7 @@ impl<'d> Epd<'d> {
             dc: PinDriver::output(dc.downgrade_output())?,
             rst: PinDriver::output(rst.downgrade_output())?,
             busy: PinDriver::input(busy.downgrade_input())?,
+            primed: false,
         };
         epd.cs.set_high()?;
         epd.rst.set_high()?;
@@ -158,6 +188,7 @@ impl<'d> Epd<'d> {
     /// Resets the panel and runs the power-up sequence. Required before the
     /// first refresh, and after [`Epd::sleep`].
     pub fn init(&mut self) -> Result<(), EspError> {
+        self.primed = false;
         // Busy-wait rather than yielding: the FreeRTOS tick is 100Hz here, so
         // a one-tick sleep can return in well under the 10ms the panel needs.
         self.rst.set_low()?;
@@ -185,7 +216,13 @@ impl<'d> Epd<'d> {
         self.write(Cmd::GateDrivingVoltage, &[0x17])?;
         self.write(Cmd::SourceDrivingVoltage, &[0x41, 0xA8, 0x32])?;
 
-        self.write(Cmd::BorderWaveform, &[0x01])?;
+        // Border waveform (0x3C): bits 7:6 pick the VBD source (00 GS
+        // transition, 01 fix level, 10 VCOM, 11 HiZ) and bits 5:4 the level for
+        // a fixed one (00 VSS, 01 VSH1, 10 VSL, 11 VSH2). The vendor's 0x01
+        // makes the border follow LUT1 as a transition, which is why it drifts
+        // to grey; pinning it to VSH1 -- the level the waveform tables use to
+        // drive white -- keeps it paper-coloured.
+        self.write(Cmd::BorderWaveform, &[0x50])?;
         self.set_window(0, 0, WIDTH, HEIGHT)
     }
 
@@ -225,6 +262,14 @@ impl<'d> Epd<'d> {
 
     /// Drives the panel from controller memory. Blocks until the panel is idle,
     /// and returns how long that took.
+    /// Drives the panel from controller memory, over whatever RAM window is
+    /// currently set. Blocks until the panel is idle, and returns how long that
+    /// took.
+    ///
+    /// Measured on this panel: a partial refresh takes ~614ms whether the
+    /// window covers the full 800x480 or only 128x64. The cost is the
+    /// waveform's frame count, not the number of gate lines scanned, so
+    /// restricting the window buys nothing.
     pub fn refresh(&mut self, mode: Refresh) -> Result<u32, EspError> {
         // Update control 1: red channel handling and single/dual chip. This
         // panel has no red channel; a full refresh bypasses it so that the
@@ -235,24 +280,44 @@ impl<'d> Epd<'d> {
                 seq::ENABLE_CLOCK
                     | seq::ENABLE_ANALOG
                     | seq::LOAD_TEMPERATURE
-                    | seq::LOAD_LUT_MODE_1
+                    | seq::LOAD_LUT
                     | seq::DISPLAY
                     | seq::DISABLE_ANALOG
                     | seq::DISABLE_CLOCK,
                 FULL_REFRESH_TIMEOUT_MS,
             ),
-            // Powering down between refreshes costs ~100ms on the next one, but
-            // leaving the panel's supplies up makes the image fade while idle.
+            // Mid-burst: the rails are up and the waveform is loaded, so all
+            // that is left to do is drive the panel. 392ms against 476ms.
+            // Never loads a waveform, so the one from load_fast_lut stays in
+            // place. Bypasses the previous image, so the current RAM bit alone
+            // selects the LUT however the display mode happens to be set.
+            Refresh::PartialFast if self.primed => (
+                [0x40, 0x00],
+                seq::DISPLAY,
+                PARTIAL_REFRESH_TIMEOUT_MS,
+            ),
+            Refresh::PartialFast => (
+                [0x40, 0x00],
+                seq::ENABLE_CLOCK | seq::ENABLE_ANALOG | seq::DISPLAY,
+                PARTIAL_REFRESH_TIMEOUT_MS,
+            ),
+            Refresh::Partial if self.primed => (
+                [0x00, 0x00],
+                seq::MODE_2 | seq::DISPLAY,
+                PARTIAL_REFRESH_TIMEOUT_MS,
+            ),
+            // First of a burst. Leaves the supplies up afterwards: powering
+            // them down here and back up next time costs more than the display
+            // phase. Call [`Epd::power_off`] once the updates stop, or the
+            // standing rails will slowly fade the image.
             Refresh::Partial => (
                 [0x00, 0x00],
                 seq::ENABLE_CLOCK
                     | seq::ENABLE_ANALOG
                     | seq::LOAD_TEMPERATURE
-                    | seq::LOAD_LUT_MODE_1
-                    | seq::LOAD_LUT_MODE_2
-                    | seq::DISPLAY
-                    | seq::DISABLE_ANALOG
-                    | seq::DISABLE_CLOCK,
+                    | seq::LOAD_LUT
+                    | seq::MODE_2
+                    | seq::DISPLAY,
                 PARTIAL_REFRESH_TIMEOUT_MS,
             ),
         };
@@ -264,7 +329,71 @@ impl<'d> Epd<'d> {
         let started = unsafe { esp_idf_sys::esp_timer_get_time() };
         self.command(Cmd::MasterActivation)?;
         self.wait_while_busy("refresh", timeout_ms)?;
+        // A full refresh powers down on its way out and leaves the mode 1
+        // waveform behind, so only a partial refresh leaves us primed.
+        self.primed = mode != Refresh::Full;
         Ok(((unsafe { esp_idf_sys::esp_timer_get_time() } - started) / 1000) as u32)
+    }
+
+    /// Replaces the waveform from OTP with a minimal differential one: pixels
+    /// that are not changing are held, and each of the two transitions gets a
+    /// single phase of `frames`.
+    ///
+    /// Fewer frames means a faster refresh and a weaker transition; too few and
+    /// pixels stop part way, which reads as grey rather than black or white.
+    /// Only [`Refresh::PartialFast`] uses this -- any other refresh loads the
+    /// waveform from OTP again, so this has to be called afresh afterwards.
+    /// Sets the border waveform register (0x3C). Takes effect on the next
+    /// refresh; [`Epd::init`] already picks a fixed white.
+    #[allow(dead_code)]
+    pub fn set_border(&mut self, value: u8) -> Result<(), EspError> {
+        self.write(Cmd::BorderWaveform, &[value])
+    }
+
+    #[allow(dead_code)]
+    pub fn load_fast_lut(&mut self, frames: u8) -> Result<(), EspError> {
+        let mut ws = [0u8; 105];
+        // Bytes 0..49 hold LUT0..LUT4, ten bytes each. Only phase A of group 0
+        // is used, so only the first byte of each LUT is non-zero.
+        //
+        // Every LUT drives its pixel straight at the target level rather than
+        // holding the ones that have not changed: with Display Update Control 1
+        // bypassing the previous image, the current RAM bit alone picks the LUT
+        // (Table 6-5), so LUT0/LUT2 are the black cases and LUT1/LUT3 white. An
+        // earlier attempt held LUT0 at zero on the assumption that Mode 2 would
+        // be indexing on (previous, current); black was then driven by nothing
+        // at all, and the screen stayed blank.
+        ws[0] = PHASE_VSH1; // -> black
+        ws[10] = PHASE_VSL; // -> white
+        ws[20] = PHASE_VSH1; // LUT2 = LUT0
+        ws[30] = PHASE_VSL; // LUT3 = LUT1
+        // Bytes 50..99 are ten groups of TP[A], TP[B], TP[C], TP[D], RP. A
+        // phase length of zero skips that phase, so the rest stay silent.
+        ws[50] = frames;
+        // Bytes 100..104 set the frame rate; every vendor table uses this value.
+        ws[100..105].fill(0x22);
+
+        self.write(Cmd::WriteLut, &ws)?;
+        self.wait_while_busy("load lut", RESET_TIMEOUT_MS)?;
+        // A table from OTP carries these in its tail (bytes 105..109); a
+        // waveform written by hand has to set them separately.
+        self.write(Cmd::GateDrivingVoltage, &[0x17])?;
+        self.write(Cmd::SourceDrivingVoltage, &[0x41, 0xA8, 0x32])?;
+        self.write(Cmd::WriteVcom, &[0x48])
+    }
+
+    /// Drops the panel's driving voltages without touching the controller. A
+    /// [`Refresh::Partial`] leaves them up so that a burst of updates does not
+    /// pay to raise them each time; this puts them back down once the burst is
+    /// over, before the standing rails start fading the image.
+    pub fn power_off(&mut self) -> Result<(), EspError> {
+        self.write(
+            Cmd::UpdateControl2,
+            &[seq::ENABLE_CLOCK | seq::DISABLE_ANALOG | seq::DISABLE_CLOCK],
+        )?;
+        self.command(Cmd::MasterActivation)?;
+        self.primed = false;
+        self.wait_while_busy("power off", PARTIAL_REFRESH_TIMEOUT_MS)
     }
 
     /// Cuts the panel's internal supplies. Draws ~1uA, but only [`Epd::init`]

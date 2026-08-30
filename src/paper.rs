@@ -1,51 +1,72 @@
-//! Demo for the GDEQ0426T82 e-paper panel with its FT6336U touch overlay:
-//! a counter with a button either side of it.
+//! Freehand drawing on the GDEQ0426T82 panel with its FT6336U touch overlay.
 //!
-//! Everything is drawn in portrait, which is the orientation the panel's own
-//! artwork reads in and the one the touch controller reports, so screen and
-//! touch coordinates are the same thing.
+//! Everything is in portrait, which is the orientation the panel's artwork
+//! reads in and the one the touch controller reports, so screen and touch
+//! coordinates are the same thing.
+//!
+//! A partial refresh costs a fixed ~614ms on this panel regardless of how small
+//! a window it is given, so strokes can only ever appear about 1.4 times a
+//! second. The loop below is built around that: points keep accumulating while
+//! the panel is busy and land together on the next update, so the drawing lags
+//! the finger but never loses any of it.
 
 use embedded_graphics::{
-    framebuffer,
     mono_font::{ascii::FONT_10X20, MonoTextStyle},
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{Line, PrimitiveStyle, Rectangle},
-    text::{Alignment, LineHeight, Text, TextStyleBuilder},
+    primitives::{Circle, Line, PrimitiveStyle, Rectangle},
+    text::{Alignment, Text},
 };
 use esp_idf_svc::hal::{delay::FreeRtos, gpio::InputPin, prelude::Peripherals};
-use std::{
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        mpsc, Arc,
-    },
-    thread,
-};
+use std::{sync::mpsc, thread, time::Duration};
 
 use crate::{
     ft6336::{Ft6336, Touch},
-    gdeq0426t82::{Bank, Epd, FrameBuffer, Refresh, SCREEN_HEIGHT, SCREEN_WIDTH},
-    qr::QrImage,
+    gdeq0426t82::{Bank, Epd, FrameBuffer, Refresh, SCREEN_WIDTH},
 };
 
 /// Comfortably faster than the controller's own scan period, so no report is
 /// missed. Needs CONFIG_FREERTOS_HZ=1000 to mean anything below 10ms.
 const POLL_INTERVAL_MS: u32 = 5;
 
-/// Whatever the code should carry. Encoded once at startup rather than per
-/// redraw, and the pixels come out identical every time, so a partial refresh
-/// diffs it away to nothing.
-const QR_PAYLOAD: &str = "https://www.good-display.com/product/457.html";
+const STROKE_WIDTH: u32 = 3;
 
-// Portrait layout, 480 wide by 800 tall.
-const TITLE_Y: i32 = 60;
-const QR_AT: Point = Point::new(120, 90);
-const QR_SIZE: Size = Size::new(240, 240);
-const BUTTON_SIZE: Size = Size::new(120, 120);
-const MINUS_AT: Point = Point::new(60, 560);
-const PLUS_AT: Point = Point::new(300, 560);
-const COUNTER_AT: Point = Point::new(160, 360);
-const COUNTER_SIZE: Size = Size::new(160, 160);
+/// Partial refreshes leave residue behind, so a full one has to happen
+/// eventually. It flashes for ~1.7s, so it waits for the pen to lift rather
+/// than interrupting a stroke.
+const PARTIALS_BEFORE_FULL: u32 = 12;
+
+/// How long to leave the panel's rails up after the last stroke. Raising them
+/// costs ~84ms on the next refresh, so riding through the pauses in the middle
+/// of drawing is worth it; leaving them up indefinitely fades the image.
+const IDLE_POWER_OFF_MS: u64 = 3_000;
+
+/// Whether strokes use the custom waveform from [`FAST_LUT_FRAMES`] instead of
+/// the one in OTP. It is roughly four times faster, but a single unidirectional
+/// phase has no DC balance the way OTP's oscillating waveform does, so residue
+/// builds up faster than the periodic full refresh can clear it and old strokes
+/// keep showing through. Flip this to experiment.
+const FAST_STROKES: bool = false;
+
+/// Frames the custom stroke waveform drives for. The panel runs 19.65ms per
+/// frame, so this is roughly a 100ms refresh against OTP's 393ms. Short enough
+/// that a stroke lands well short of full black; the periodic full refresh is
+/// what takes it the rest of the way and clears the residue.
+const FAST_LUT_FRAMES: u8 = 5;
+
+
+const CLEAR_AT: Point = Point::new(SCREEN_WIDTH as i32 - 100, 20);
+const CLEAR_SIZE: Size = Size::new(80, 56);
+
+/// What the touch thread reports.
+enum Ink {
+    /// The finger is here; join it to wherever it was last seen.
+    At(Point),
+    /// The finger left the glass, so the next point starts a new stroke.
+    Lifted,
+    /// The clear button was pressed.
+    Clear,
+}
 
 pub(crate) fn run() {
     if let Err(e) = try_run() {
@@ -68,81 +89,148 @@ fn try_run() -> anyhow::Result<()> {
     )?;
     let touch = Ft6336::new(peripherals.i2c0, pins.gpio32, pins.gpio33, pins.gpio36)?;
 
-    // Clear whatever the panel was showing, then put the interface up. The
-    // first image goes into both of the controller's banks, so that the partial
-    // refreshes below have a correct starting point to diff against.
     epd.init()?;
     epd.fill(0xFF)?;
     log::info!("cleared in {}ms", epd.refresh(Refresh::Full)?);
 
-    let counter: u8 = 0;
+    // The canvas goes into both of the controller's banks, so that the partial
+    // refreshes below have a correct starting point to diff against.
     let mut frame = FrameBuffer::new();
-    // draw_ui(&mut frame, counter, &qr);
+    draw_chrome(&mut frame);
     frame.flush(&mut epd, Bank::Both)?;
-    log::info!("base image in {}ms", epd.refresh(Refresh::Full)?);
+    log::info!("canvas in {}ms", epd.refresh(Refresh::Full)?);
+    if FAST_STROKES {
+        epd.load_fast_lut(FAST_LUT_FRAMES)?;
+    }
 
     // Touch polling runs on its own thread: a refresh blocks on BUSY for
-    // ~600ms, and taps that land in that window would otherwise be dropped.
-    let counter = Arc::new(AtomicU8::new(counter));
-    let (changes, change) = mpsc::channel();
-    thread::Builder::new().stack_size(4096).spawn({
-        let counter = Arc::clone(&counter);
-        move || poll_touch(touch, &counter, &changes)
-    })?;
+    // ~614ms, and everything drawn in that window would otherwise be dropped.
+    let (ink, strokes) = mpsc::channel();
+    thread::Builder::new()
+        .stack_size(4096)
+        .spawn(move || poll_touch(touch, &ink))?;
 
-    let mut prev: Option<Point> = None;
+    let mut pen = None;
+    let mut partials = 0;
     loop {
-        // Block until something changed, then swallow everything else that has
-        // queued up: the panel can only ever show the newest value, so a burst
-        // of taps during a refresh collapses into one redraw.
-        match change.recv() {
-            Ok((point, pressed, released)) => {
-                draw_next(&mut prev, point, pressed, released, &mut frame);
+        // Take whatever is already waiting; if nothing is, the burst is over,
+        // so drop the panel's rails before settling in to wait. Leaving them up
+        // is what makes a burst fast, but it fades the image if left standing.
+        let first = match strokes.recv_timeout(Duration::from_millis(IDLE_POWER_OFF_MS)) {
+            Ok(ink) => ink,
+            // Drawing has actually stopped, not just paused mid-stroke.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                epd.power_off()?;
+                let Ok(ink) = strokes.recv() else {
+                    return Ok(()); // touch thread is gone
+                };
+                ink
             }
-            Err(_) => {}
-        }
-        while let Ok((point, pressed, released)) = change.try_recv() {
-            draw_next(&mut prev, point, pressed, released, &mut frame);
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let mut state = apply(&mut pen, first, &mut frame);
+        while let Ok(next) = strokes.try_recv() {
+            state = state.max(apply(&mut pen, next, &mut frame));
         }
 
-        // draw_ui(&mut frame, value, &qr);
-        log::info!("redrawing");
-        frame.flush(&mut epd, Bank::Current)?;
-        epd.refresh(Refresh::Partial)?;
+        match state {
+            Update::Cleared => {
+                frame.flush(&mut epd, Bank::Both)?;
+                log::info!("cleared in {}ms", epd.refresh(Refresh::Full)?);
+                if FAST_STROKES {
+                    epd.load_fast_lut(FAST_LUT_FRAMES)?;
+                }
+                partials = 0;
+            }
+            // Take the flash now that the pen is up rather than mid-stroke.
+            Update::Lifted if partials >= PARTIALS_BEFORE_FULL => {
+                frame.flush(&mut epd, Bank::Both)?;
+                log::info!("de-ghosted in {}ms", epd.refresh(Refresh::Full)?);
+                if FAST_STROKES {
+                    epd.load_fast_lut(FAST_LUT_FRAMES)?;
+                }
+                partials = 0;
+            }
+            _ => {
+                frame.flush(&mut epd, Bank::Current)?;
+                let mode = if FAST_STROKES {
+                    Refresh::PartialFast
+                } else {
+                    Refresh::Partial
+                };
+                log::info!("stroke in {}ms", epd.refresh(mode)?);
+                partials += 1;
+            }
+        }
     }
 }
 
-fn draw_next(
-    prev: &mut Option<Point>,
-    point: Option<Point>,
-    pressed: bool,
-    released: bool,
-    frame: &mut FrameBuffer,
-) {
-    // log::info!("drawing at {:?}", point);
-    if let Some(prev) = prev {
-        if let Some(point) = point {
-            Line::new(*prev, point)
-                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
-                .draw(frame)
-                .ok();
-        }
-    } else if let Some(point) = point {
-        embedded_graphics::Pixel(point, BinaryColor::On)
-            .draw(frame)
-            .ok();
-    }
-    *prev = point;
+/// What the batch of events just applied to the canvas asks of the panel,
+/// ordered so that the most demanding one in a batch wins.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Update {
+    Drawn,
+    Lifted,
+    Cleared,
 }
 
-/// Polls the controller and folds button presses into `counter`, waking the
-/// render loop through `changes` whenever it moves.
-fn poll_touch<INT: InputPin>(
-    mut touch: Ft6336<'static, INT>,
-    counter: &AtomicU8,
-    changes: &mpsc::Sender<(Option<Point>, bool, bool)>,
-) {
+fn apply(pen: &mut Option<Point>, ink: Ink, frame: &mut FrameBuffer) -> Update {
+    // `FrameBuffer`'s draw error is Infallible, so none of these can fail.
+    match ink {
+        Ink::At(point) => {
+            match *pen {
+                Some(from) => {
+                    let _ = Line::new(from, point)
+                        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, STROKE_WIDTH))
+                        .draw(frame);
+                }
+                // Pen-down: a stroke that is only one point long still has to
+                // leave a mark, and the same width as the line that may follow.
+                None => {
+                    let _ = Circle::with_center(point, STROKE_WIDTH)
+                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                        .draw(frame);
+                }
+            }
+            *pen = Some(point);
+            Update::Drawn
+        }
+        Ink::Lifted => {
+            *pen = None;
+            Update::Lifted
+        }
+        Ink::Clear => {
+            *pen = None;
+            frame.clear_white();
+            draw_chrome(frame);
+            Update::Cleared
+        }
+    }
+}
+
+/// The one piece of fixed furniture on the canvas.
+fn draw_chrome(frame: &mut FrameBuffer) {
+    let button = Rectangle::new(CLEAR_AT, CLEAR_SIZE);
+    let _ = button
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
+        .draw(frame);
+    let label = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
+    let centre = button.center();
+    let _ = Text::with_alignment(
+        "clear",
+        Point::new(centre.x, centre.y + 7),
+        label,
+        Alignment::Center,
+    )
+    .draw(frame);
+}
+
+fn poll_touch<INT: InputPin>(mut touch: Ft6336<'static, INT>, ink: &mpsc::Sender<Ink>) {
     let mut was_down = false;
+    // Set when a stroke began on the clear button, so that dragging off it does
+    // not leave a trail behind.
+    let mut swallow = false;
+
     loop {
         let touches = match touch.read() {
             Ok(touches) => touches,
@@ -152,23 +240,31 @@ fn poll_touch<INT: InputPin>(
             }
         };
 
+        let point = touches.first().map(screen_point);
+        let is_down = point.is_some();
         // Act on the moment a finger lands, not on every scan while it rests
-        // there, otherwise holding a button runs the counter away. Polling well
-        // inside the controller's scan period makes this edge dependable: a tap
-        // or a gap between taps would have to be under ~14ms to slip past, and
-        // a finger cannot move that fast.
-        let is_down = !touches.is_empty();
+        // there. Polling well inside the controller's scan period makes this
+        // edge dependable: a tap or a gap between taps would have to be under
+        // ~14ms to slip past, and a finger cannot move that fast.
         let pressed = is_down && !was_down;
         let released = !is_down && was_down;
         was_down = is_down;
 
-        let point = if is_down {
-            Some(screen_point(&touches[0]))
-        } else {
-            None
+        let event = match point {
+            Some(point) if pressed && Rectangle::new(CLEAR_AT, CLEAR_SIZE).contains(point) => {
+                swallow = true;
+                Some(Ink::Clear)
+            }
+            Some(point) if !swallow => Some(Ink::At(point)),
+            _ if released => {
+                swallow = false;
+                Some(Ink::Lifted)
+            }
+            _ => None,
         };
-        if point.is_some() || released {
-            if changes.send((point, pressed, released)).is_err() {
+
+        if let Some(event) = event {
+            if ink.send(event).is_err() {
                 return; // render loop is gone
             }
         }
@@ -180,67 +276,4 @@ fn poll_touch<INT: InputPin>(
 /// just a change of type.
 fn screen_point(touch: &Touch) -> Point {
     Point::new(touch.x as i32, touch.y as i32)
-}
-
-/// Returns the step for whichever button contains `point`, if any.
-fn button_at(point: Point) -> Option<i8> {
-    if Rectangle::new(MINUS_AT, BUTTON_SIZE).contains(point) {
-        Some(-1)
-    } else if Rectangle::new(PLUS_AT, BUTTON_SIZE).contains(point) {
-        Some(1)
-    } else {
-        None
-    }
-}
-
-fn draw_ui(frame: &mut FrameBuffer, counter: u8, qr: &QrImage) {
-    let outline = PrimitiveStyle::with_stroke(BinaryColor::On, 3);
-    let label = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
-
-    frame.clear_white();
-
-    // `FrameBuffer`'s draw error is Infallible, so none of these can fail.
-    let text_style = TextStyleBuilder::new()
-        .line_height(LineHeight::Pixels(50))
-        .alignment(Alignment::Center)
-        .build();
-    let _ = Text::with_text_style(
-        "GDEQ0426T82 + FT6336U",
-        Point::new(SCREEN_WIDTH as i32 / 2, TITLE_Y),
-        label,
-        text_style,
-    )
-    .draw(frame);
-
-    let _ = qr.draw(frame);
-
-    for (at, text) in [(MINUS_AT, "-"), (PLUS_AT, "+")] {
-        let button = Rectangle::new(at, BUTTON_SIZE);
-        let _ = button.into_styled(outline).draw(frame);
-        let _ = Text::with_alignment(text, center_of(button), label, Alignment::Center).draw(frame);
-    }
-
-    let counter_box = Rectangle::new(COUNTER_AT, COUNTER_SIZE);
-    let _ = counter_box.into_styled(outline).draw(frame);
-    let digit = [counter + b'0'];
-    let digit = core::str::from_utf8(&digit).unwrap_or("?");
-    let _ =
-        Text::with_alignment(digit, center_of(counter_box), label, Alignment::Center).draw(frame);
-
-    let _ = Text::with_alignment(
-        "tap a button",
-        Point::new(SCREEN_WIDTH as i32 / 2, SCREEN_HEIGHT as i32 - 60),
-        label,
-        Alignment::Center,
-    )
-    .draw(frame);
-}
-
-/// Centre of `rect`, nudged so that a single line of text sits on its middle.
-fn center_of(rect: Rectangle) -> Point {
-    let center = rect.center();
-    Point::new(
-        center.x,
-        center.y + FONT_10X20.character_size.height as i32 / 3,
-    )
 }
