@@ -97,6 +97,9 @@ mod seq {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Bank {
     Current,
+    /// The previous image on its own. Only useful for setting up a known state
+    /// to probe what the differential update actually keys on.
+    Previous,
     Both,
 }
 
@@ -111,8 +114,14 @@ pub enum Bank {
 /// Measured: the panel runs the LUT at
 /// 19.65ms per frame, so a refresh costs `frames * 19.65ms`, plus 218ms if the
 /// rails have to be raised and dropped around it.
-const PHASE_VSH1: u8 = 0b01 << 6;
-const PHASE_VSL: u8 = 0b10 << 6;
+const VSS: u8 = 0b00;
+const VSH1: u8 = 0b01;
+const VSL: u8 = 0b10;
+
+/// Packs the four phases of one group into a LUT byte, phase A in the top pair.
+const fn phases(a: u8, b: u8, c: u8, d: u8) -> u8 {
+    a << 6 | b << 4 | c << 2 | d
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Refresh {
@@ -127,6 +136,10 @@ pub enum Refresh {
     /// whatever [`Epd::load_fast_lut`] last wrote instead of the one in OTP.
     #[allow(dead_code)]
     PartialFast,
+    /// As [`Refresh::PartialFast`], but leaves the previous image live so that
+    /// the four LUT slots of [`Epd::load_hybrid_lut`] each apply to their own
+    /// class of pixel.
+    PartialHybrid,
 }
 
 pub struct Epd<'d> {
@@ -238,8 +251,10 @@ impl<'d> Epd<'d> {
         h: u16,
         bank: Bank,
     ) -> Result<(), EspError> {
-        self.write_ram(Cmd::WriteRamCurrent, bitmap, x, y, w, h)?;
-        if bank == Bank::Both {
+        if bank != Bank::Previous {
+            self.write_ram(Cmd::WriteRamCurrent, bitmap, x, y, w, h)?;
+        }
+        if bank != Bank::Current {
             self.write_ram(Cmd::WriteRamPrevious, bitmap, x, y, w, h)?;
         }
         Ok(())
@@ -291,6 +306,16 @@ impl<'d> Epd<'d> {
             // Never loads a waveform, so the one from load_fast_lut stays in
             // place. Bypasses the previous image, so the current RAM bit alone
             // selects the LUT however the display mode happens to be set.
+            Refresh::PartialHybrid if self.primed => (
+                [0x00, 0x00],
+                seq::MODE_2 | seq::DISPLAY,
+                PARTIAL_REFRESH_TIMEOUT_MS,
+            ),
+            Refresh::PartialHybrid => (
+                [0x00, 0x00],
+                seq::ENABLE_CLOCK | seq::ENABLE_ANALOG | seq::MODE_2 | seq::DISPLAY,
+                PARTIAL_REFRESH_TIMEOUT_MS,
+            ),
             Refresh::PartialFast if self.primed => (
                 [0x40, 0x00],
                 seq::DISPLAY,
@@ -343,6 +368,264 @@ impl<'d> Epd<'d> {
     /// pixels stop part way, which reads as grey rather than black or white.
     /// Only [`Refresh::PartialFast`] uses this -- any other refresh loads the
     /// waveform from OTP again, so this has to be called afresh afterwards.
+    /// Probe kept for re-confirming the LUT slot mapping: gives each of the four
+    /// slots a different amount of drive
+    /// towards black -- LUT0 four phases, LUT1 three, LUT2 two, LUT3 one -- then
+    /// displays in Mode 2 with the previous image live. Whatever pattern of
+    /// greys comes out tells us what the hardware keys the LUT choice on.
+    #[allow(dead_code)]
+    pub fn display_lut_probe(&mut self) -> Result<u32, EspError> {
+        let mut ws = [0u8; 105];
+        // Phase A..D of group 0, two bits each, 01 = VSH1 = towards black.
+        ws[0] = phases(VSH1, VSH1, VSH1, VSH1); // LUT0: 4 phases
+        ws[10] = phases(VSH1, VSH1, VSH1, VSS); // LUT1: 3 phases
+        ws[20] = phases(VSH1, VSH1, VSS, VSS); // LUT2: 2 phases
+        ws[30] = phases(VSH1, VSS, VSS, VSS); // LUT3: 1 phase
+        ws[50..55].copy_from_slice(&[5, 5, 5, 5, 0]); // TP[A..D], RP
+        ws[100..105].fill(0x22);
+
+        self.write(Cmd::WriteLut, &ws)?;
+        self.wait_while_busy("load probe lut", RESET_TIMEOUT_MS)?;
+        self.write(Cmd::GateDrivingVoltage, &[0x17])?;
+        self.write(Cmd::SourceDrivingVoltage, &[0x41, 0xA8, 0x32])?;
+        self.write(Cmd::WriteVcom, &[0x48])?;
+
+        // Previous image live (not bypassed), Mode 2, no LUT load from OTP.
+        self.write(Cmd::UpdateControl1, &[0x00, 0x00])?;
+        self.write(
+            Cmd::UpdateControl2,
+            &[seq::ENABLE_CLOCK
+                | seq::ENABLE_ANALOG
+                | seq::MODE_2
+                | seq::DISPLAY
+                | seq::DISABLE_ANALOG
+                | seq::DISABLE_CLOCK],
+        )?;
+        let started = unsafe { esp_idf_sys::esp_timer_get_time() };
+        self.command(Cmd::MasterActivation)?;
+        self.wait_while_busy("probe", FULL_REFRESH_TIMEOUT_MS)?;
+        self.primed = false;
+        Ok(((unsafe { esp_idf_sys::esp_timer_get_time() } - started) / 1000) as u32)
+    }
+
+    /// A differential waveform that drives only the pixels presented as
+    /// transitions and holds everything else at exactly zero.
+    ///
+    /// Confirmed by probing the hardware: the LUT slot is chosen by
+    /// `(previous << 1) | current`, where a set bit is white.
+    ///
+    /// | slot | (prev, cur) | gets |
+    /// |---|---|---|
+    /// | LUT0 | black, black | nothing -- held |
+    /// | LUT1 | black, white | `frames` towards white |
+    /// | LUT2 | white, black | `frames` towards black |
+    /// | LUT3 | white, white | nothing -- held |
+    ///
+    /// Holding both unchanged classes is what keeps this usable. A differential
+    /// waveform does not need to be self-balanced the way a full refresh does:
+    /// charge balances over a pixel's transition history, a drive to black being
+    /// cancelled by a later drive to white. That only works while pixels that
+    /// are not transitioning contribute nothing, which is why any per-refresh
+    /// top-up of standing state -- however small -- accumulates without bound
+    /// and cannot be cancelled.
+    ///
+    /// Use [`Epd::flush_with_drive`] to choose which pixels count as
+    /// transitions.
+    #[allow(dead_code)] // superseded by load_graded_lut; kept for comparison
+    pub fn load_hybrid_lut(&mut self, frames: u8) -> Result<(), EspError> {
+        let mut ws = [0u8; 105];
+        ws[0] = phases(VSS, VSS, VSS, VSS); // LUT0: held
+        ws[10] = phases(VSL, VSS, VSS, VSS); // LUT1: driven white
+        ws[20] = phases(VSH1, VSS, VSS, VSS); // LUT2: driven black
+        ws[30] = phases(VSS, VSS, VSS, VSS); // LUT3: held
+        ws[50..55].copy_from_slice(&[frames, 0, 0, 0, 0]);
+        ws[100..105].fill(0x22);
+
+        self.write(Cmd::WriteLut, &ws)?;
+        self.wait_while_busy("load lut", RESET_TIMEOUT_MS)?;
+        self.write(Cmd::GateDrivingVoltage, &[0x17])?;
+        self.write(Cmd::SourceDrivingVoltage, &[0x41, 0xA8, 0x32])?;
+        self.write(Cmd::WriteVcom, &[0x48])
+    }
+
+    /// Writes both image banks so that each pixel lands in the LUT slot we
+    /// want: `target` becomes the current image and `target ^ drive` the
+    /// previous one.
+    ///
+    /// A set bit in `drive` therefore presents that pixel as a transition, so
+    /// [`Epd::load_hybrid_lut`] drives it towards whatever `target` says; a
+    /// clear bit presents it as unchanged and it is held at zero. Several drive
+    /// masks are OR-ed together, which lets a caller keep one mask per recent
+    /// pass and give a pixel a bounded number of drives without needing a
+    /// per-pixel counter.
+    #[allow(dead_code)] // the area variant covers the whole screen if asked
+    pub fn flush_with_drive(&mut self, target: &[u8], drive: &[&[u8]]) -> Result<(), EspError> {
+        self.write_ram(Cmd::WriteRamCurrent, target, 0, 0, WIDTH, HEIGHT)?;
+
+        self.set_window(0, 0, WIDTH, HEIGHT)?;
+        self.command(Cmd::WriteRamPrevious)?;
+        self.dc.set_high()?;
+        self.cs.set_low()?;
+        let mut row = [0u8; ROW_BYTES];
+        let result = (0..HEIGHT as usize).try_for_each(|line| {
+            let at = line * ROW_BYTES;
+            for (i, byte) in row.iter_mut().enumerate() {
+                let driven = drive.iter().fold(0u8, |acc, mask| acc | mask[at + i]);
+                *byte = target[at + i] ^ driven;
+            }
+            self.spi.write(&row)
+        });
+        self.cs.set_high()?;
+        result
+    }
+
+    /// As [`Epd::flush_with_drive`], but writes only `area` of each bank.
+    ///
+    /// `area` is in screen coordinates and is rounded outward to whole bytes in
+    /// y, because the screen's y is the panel's native x and RAM is addressed in
+    /// bytes along it. Since the buffers are full-width, each row of the region
+    /// is a slice out of the middle of a framebuffer row -- hence the explicit
+    /// stride rather than reusing [`Epd::draw`].
+    #[allow(dead_code)] // the graded variant is what the demo uses
+    pub fn flush_with_drive_area(
+        &mut self,
+        target: &[u8],
+        drive: &[&[u8]],
+        area: Rectangle,
+    ) -> Result<(), EspError> {
+        let Some(corner) = area.bottom_right() else {
+            return Ok(());
+        };
+        let x0 = area.top_left.x.clamp(0, SCREEN_WIDTH as i32 - 1) as u16;
+        let x1 = (corner.x + 1).clamp(0, SCREEN_WIDTH as i32) as u16;
+        let y0 = (area.top_left.y.clamp(0, SCREEN_HEIGHT as i32 - 1) as u16) & !7;
+        let y1 = (((corner.y + 1).clamp(0, SCREEN_HEIGHT as i32) as u16) + 7) & !7;
+        if x1 <= x0 || y1 <= y0 {
+            return Ok(());
+        }
+
+        let first = (y0 / 8) as usize;
+        let len = ((y1 - y0) / 8) as usize;
+
+        for (cmd, xor) in [(Cmd::WriteRamCurrent, false), (Cmd::WriteRamPrevious, true)] {
+            // Native x is the screen's y, native y the screen's x.
+            self.set_window(y0, x0, y1 - y0, x1 - x0)?;
+            self.command(cmd)?;
+            self.dc.set_high()?;
+            self.cs.set_low()?;
+            let mut row = [0u8; ROW_BYTES];
+            let result = (x0..x1).try_for_each(|screen_x| {
+                let at = screen_x as usize * ROW_BYTES + first;
+                let line = &target[at..at + len];
+                if !xor {
+                    self.spi.write(line)
+                } else {
+                    for (i, byte) in row[..len].iter_mut().enumerate() {
+                        let driven = drive.iter().fold(0u8, |acc, mask| acc | mask[at + i]);
+                        *byte = line[i] ^ driven;
+                    }
+                    self.spi.write(&row[..len])
+                }
+            });
+            self.cs.set_high()?;
+            result?;
+        }
+        Ok(())
+    }
+
+    /// A waveform with two strengths of drive towards black, so a stroke can be
+    /// taken most of the way in the pass it is drawn and only topped up after.
+    ///
+    /// | slot | (prev, cur) | gets |
+    /// |---|---|---|
+    /// | LUT0 | black, black | nothing -- held |
+    /// | LUT1 | black, white | `heal_frames` towards black |
+    /// | LUT2 | white, black | `fresh_frames` towards black |
+    /// | LUT3 | white, white | nothing -- held |
+    ///
+    /// LUT1 would normally erase towards white. Spending it on a weak black
+    /// drive instead is only possible because erasing happens through a full
+    /// refresh, never a partial one -- so no pixel ever needs driving white here.
+    ///
+    /// Note the refresh costs `fresh_frames` regardless of how many pixels are
+    /// healing: the phase lengths are shared, and healing rides inside phase A
+    /// which the fresh pixels are being driven for anyway.
+    pub fn load_graded_lut(&mut self, heal_frames: u8, fresh_frames: u8) -> Result<(), EspError> {
+        let extra = fresh_frames.saturating_sub(heal_frames);
+        let mut ws = [0u8; 105];
+        ws[0] = phases(VSS, VSS, VSS, VSS); // LUT0: held
+        ws[10] = phases(VSH1, VSS, VSS, VSS); // LUT1: weak, phase A only
+        ws[20] = phases(VSH1, VSH1, VSS, VSS); // LUT2: strong, both phases
+        ws[30] = phases(VSS, VSS, VSS, VSS); // LUT3: held
+        ws[50..55].copy_from_slice(&[heal_frames, extra, 0, 0, 0]);
+        ws[100..105].fill(0x22);
+
+        self.write(Cmd::WriteLut, &ws)?;
+        self.wait_while_busy("load lut", RESET_TIMEOUT_MS)?;
+        self.write(Cmd::GateDrivingVoltage, &[0x17])?;
+        self.write(Cmd::SourceDrivingVoltage, &[0x41, 0xA8, 0x32])?;
+        self.write(Cmd::WriteVcom, &[0x48])
+    }
+
+    /// Writes `area` of both banks so that `fresh` pixels land in LUT2, `older`
+    /// ones in LUT1, and everything else is held.
+    ///
+    /// The encoding falls out symmetrically: flipping a pixel in the current
+    /// bank presents it as `(black, white)`, and flipping it in the previous
+    /// bank presents it as `(white, black)`. So
+    ///
+    /// ```text
+    /// current  = target ^ healing
+    /// previous = target ^ fresh
+    /// ```
+    ///
+    /// A pixel drawn again while still healing must count as fresh only --
+    /// flipping both banks would land it back on a held slot.
+    pub fn flush_graded_area(
+        &mut self,
+        target: &[u8],
+        fresh: &[u8],
+        older: &[&[u8]],
+        area: Rectangle,
+    ) -> Result<(), EspError> {
+        let Some(corner) = area.bottom_right() else {
+            return Ok(());
+        };
+        let x0 = area.top_left.x.clamp(0, SCREEN_WIDTH as i32 - 1) as u16;
+        let x1 = (corner.x + 1).clamp(0, SCREEN_WIDTH as i32) as u16;
+        let y0 = (area.top_left.y.clamp(0, SCREEN_HEIGHT as i32 - 1) as u16) & !7;
+        let y1 = (((corner.y + 1).clamp(0, SCREEN_HEIGHT as i32) as u16) + 7) & !7;
+        if x1 <= x0 || y1 <= y0 {
+            return Ok(());
+        }
+        let first = (y0 / 8) as usize;
+        let len = ((y1 - y0) / 8) as usize;
+
+        for (cmd, use_fresh) in [(Cmd::WriteRamCurrent, false), (Cmd::WriteRamPrevious, true)] {
+            self.set_window(y0, x0, y1 - y0, x1 - x0)?;
+            self.command(cmd)?;
+            self.dc.set_high()?;
+            self.cs.set_low()?;
+            let mut row = [0u8; ROW_BYTES];
+            let result = (x0..x1).try_for_each(|screen_x| {
+                let at = screen_x as usize * ROW_BYTES + first;
+                for (i, byte) in row[..len].iter_mut().enumerate() {
+                    let f = fresh[at + i];
+                    let flip = if use_fresh {
+                        f
+                    } else {
+                        older.iter().fold(0u8, |acc, m| acc | m[at + i]) & !f
+                    };
+                    *byte = target[at + i] ^ flip;
+                }
+                self.spi.write(&row[..len])
+            });
+            self.cs.set_high()?;
+            result?;
+        }
+        Ok(())
+    }
+
     /// Sets the border waveform register (0x3C). Takes effect on the next
     /// refresh; [`Epd::init`] already picks a fixed white.
     #[allow(dead_code)]
@@ -363,10 +646,10 @@ impl<'d> Epd<'d> {
         // earlier attempt held LUT0 at zero on the assumption that Mode 2 would
         // be indexing on (previous, current); black was then driven by nothing
         // at all, and the screen stayed blank.
-        ws[0] = PHASE_VSH1; // -> black
-        ws[10] = PHASE_VSL; // -> white
-        ws[20] = PHASE_VSH1; // LUT2 = LUT0
-        ws[30] = PHASE_VSL; // LUT3 = LUT1
+        ws[0] = phases(VSH1, VSS, VSS, VSS); // -> black
+        ws[10] = phases(VSL, VSS, VSS, VSS); // -> white
+        ws[20] = phases(VSH1, VSS, VSS, VSS); // LUT2 = LUT0
+        ws[30] = phases(VSL, VSS, VSS, VSS); // LUT3 = LUT1
         // Bytes 50..99 are ten groups of TP[A], TP[B], TP[C], TP[D], RP. A
         // phase length of zero skips that phase, so the rest stay silent.
         ws[50] = frames;
@@ -512,6 +795,10 @@ impl FrameBuffer {
         self.data.fill(0xFF);
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
     /// Writes the whole buffer into controller memory. Follow with
     /// [`Epd::refresh`].
     pub fn flush(&self, epd: &mut Epd<'_>, bank: Bank) -> Result<(), EspError> {
@@ -531,6 +818,68 @@ impl FrameBuffer {
         } else {
             self.data[index] |= mask;
         }
+    }
+}
+
+/// A set of pixels to drive on the next refresh, in the same layout as
+/// [`FrameBuffer`] so it can be handed straight to [`Epd::flush_with_drive`].
+/// Drawing [`BinaryColor::On`] marks a pixel for driving.
+pub struct Mask {
+    data: Box<[u8]>,
+}
+
+impl Mask {
+    pub fn new() -> Self {
+        Self {
+            data: vec![0x00; IMAGE_BYTES].into_boxed_slice(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.data.fill(0x00);
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.data.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl Default for Mask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OriginDimensions for Mask {
+    fn size(&self) -> Size {
+        Size::new(SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32)
+    }
+}
+
+impl DrawTarget for Mask {
+    type Color = BinaryColor;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(point, color) in pixels {
+            if !color.is_on() {
+                continue;
+            }
+            if let (Ok(x), Ok(y)) = (u16::try_from(point.x), u16::try_from(point.y)) {
+                if x < SCREEN_WIDTH && y < SCREEN_HEIGHT {
+                    self.data[x as usize * ROW_BYTES + y as usize / 8] |= 0x80 >> (y % 8);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
