@@ -36,7 +36,7 @@ const STROKE_WIDTH: u32 = 6;
 /// Partial refreshes leave residue behind, so a full one has to happen
 /// eventually. It flashes for ~1.7s, so it waits for the pen to lift rather
 /// than interrupting a stroke.
-const PARTIALS_BEFORE_FULL: u32 = 12;
+const PARTIALS_BEFORE_FULL: u32 = 120;
 
 /// How long to leave the panel's rails up after the last stroke. Raising them
 /// costs ~84ms on the next refresh, so riding through the pauses in the middle
@@ -64,7 +64,7 @@ const STROKES: Strokes = Strokes::Hybrid;
 /// Total convergence is `HYBRID_FRAMES * HEAL_PASSES`, so spreading a small
 /// per-pass drive over more passes keeps every individual refresh cheap while
 /// still reaching black.
-const HYBRID_FRAMES: u8 = 3;
+const HYBRID_FRAMES: u8 = 1;
 
 /// Frames an already-drawn pixel is topped up by on each later pass, via LUT1's
 /// weak drive. Deliberately much smaller than [`HYBRID_FRAMES`] so the bulk of a
@@ -288,16 +288,22 @@ fn grow(area: &mut Option<Rectangle>, by: Rectangle) {
     if by.is_zero_sized() {
         return;
     }
-    *area = Some(match (*area, area.and_then(|a| a.bottom_right()), by.bottom_right()) {
-        (Some(a), Some(ac), Some(bc)) => Rectangle::with_corners(
-            Point::new(
-                a.top_left.x.min(by.top_left.x),
-                a.top_left.y.min(by.top_left.y),
+    *area = Some(
+        match (
+            *area,
+            area.and_then(|a| a.bottom_right()),
+            by.bottom_right(),
+        ) {
+            (Some(a), Some(ac), Some(bc)) => Rectangle::with_corners(
+                Point::new(
+                    a.top_left.x.min(by.top_left.x),
+                    a.top_left.y.min(by.top_left.y),
+                ),
+                Point::new(ac.x.max(bc.x), ac.y.max(bc.y)),
             ),
-            Point::new(ac.x.max(bc.x), ac.y.max(bc.y)),
-        ),
-        _ => by,
-    });
+            _ => by,
+        },
+    );
 }
 
 /// Returns what the panel now needs, and the region the canvas changed in.
