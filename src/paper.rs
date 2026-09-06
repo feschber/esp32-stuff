@@ -22,7 +22,7 @@ use std::{sync::mpsc, thread, time::Duration};
 
 use crate::{
     ft6336::{Ft6336, Touch},
-    gdeq0426t82::{Bank, Epd, FrameBuffer, Mask, Refresh, SCREEN_WIDTH},
+    gdeq0426t82::{Bank, Charge, Epd, FrameBuffer, InkTarget, Refresh, MAX_CHARGE, SCREEN_WIDTH},
 };
 
 /// The controller produces new data every ~9ms (~110Hz, its documented
@@ -77,19 +77,17 @@ const HYBRID_FRAMES: u8 = 1;
 /// driven for anyway. So healing is free in time.
 const HYBRID_HEAL_FRAMES: u8 = 1;
 
+/// Total frames the drawing path spends pushing one pixel towards black, and so
+/// the amount that has to be given back the other way when it is erased.
+const HYBRID_TOTAL_FRAMES: u8 = HYBRID_FRAMES + (HEAL_PASSES as u8 - 1) * HYBRID_HEAL_FRAMES;
+
 /// How many consecutive refreshes a freshly drawn pixel keeps being driven for.
-/// One drive mask is kept per pass, at 48KB each, and a pixel drops out of the
-/// set once its mask is recycled -- which is what bounds the charge it can
-/// accumulate.
+/// Bounded by the two bits [`Charge`] gives each pixel.
 ///
-/// At 1 every pixel gets its whole drive in the pass it is drawn, which is both
-/// uniform and cheap to write, since only the new geometry has to be sent.
-/// Above 1 a pixel needs its transition re-asserted on every pass it is still
-/// healing -- the Mode 2 refresh copies current into previous when it finishes
-/// -- so the region written grows to cover every live mask. That is where the
-/// flicker came from: the same pixels being re-driven pass after pass over a
-/// region that follows the pen. Left as a knob, but 1 is what looks right.
-const HEAL_PASSES: usize = 3;
+/// A pixel still healing needs its transition re-asserted on every pass, since a
+/// Mode 2 refresh copies current into previous when it finishes -- so the region
+/// written has to cover everything still charged, not just the new geometry.
+const HEAL_PASSES: usize = MAX_CHARGE as usize;
 
 /// Frames the custom stroke waveform drives for. The panel runs 19.65ms per
 /// frame, so this is roughly a 100ms refresh against OTP's 393ms. Short enough
@@ -150,14 +148,10 @@ fn try_run() -> anyhow::Result<()> {
         .stack_size(4096)
         .spawn(move || poll_touch(touch, &ink))?;
 
-    // One drive mask per healing pass, used as a ring. A pixel is driven on the
-    // pass it is drawn and on the next HEAL_PASSES-1, then drops out when its
-    // mask comes round again -- which is what stops charge accumulating.
-    let mut masks: Vec<Mask> = (0..HEAL_PASSES).map(|_| Mask::new()).collect();
-    // What region each mask covers. A Mode 2 refresh copies current into
-    // previous when it finishes, so a pixel that is still mid-heal has to have
-    // its transition re-asserted on every pass -- meaning the region written
-    // each time is the union of every live mask, not just what changed.
+    // How many drives each pixel still has coming. Replaces what used to be one
+    // full drive mask per pass; the bounding boxes stay, since they are what
+    // keeps the region written small, but they cost bytes rather than 48KB each.
+    let mut charge = Charge::new();
     let mut covered: Vec<Option<Rectangle>> = vec![None; HEAL_PASSES];
     let mut newest = 0usize;
     log::info!("heap free after buffers: {} bytes", unsafe {
@@ -187,14 +181,14 @@ fn try_run() -> anyhow::Result<()> {
             // `Update` is ordered so the most demanding action in a batch
             // wins: a clear arrives as Clear followed by Lifted on release, and
             // a plain assignment here would throw the clear away.
-            let (update, touched) = apply(&mut pen, pnt, &mut frame, &mut masks[newest]);
+            let (update, touched) = apply(&mut pen, pnt, &mut frame, &mut charge);
             state = state.max(update);
             if let Some(touched) = touched {
                 grow(&mut covered[newest], touched);
             }
         }
         while let Ok(next) = strokes.try_recv() {
-            let (update, touched) = apply(&mut pen, next, &mut frame, &mut masks[newest]);
+            let (update, touched) = apply(&mut pen, next, &mut frame, &mut charge);
             state = state.max(update);
             if let Some(touched) = touched {
                 grow(&mut covered[newest], touched);
@@ -203,12 +197,20 @@ fn try_run() -> anyhow::Result<()> {
 
         match state {
             Update::Cleared => {
+                // Give back what the drawing path pushed in. Everything still
+                // inked is driven towards white by the same total, so a pixel's
+                // charge nets out over a draw-and-erase cycle instead of only
+                // ever growing.
+                log::info!(
+                    "balanced in {}ms",
+                    epd.balance_to_white(frame.as_bytes(), HYBRID_TOTAL_FRAMES)?
+                );
+                frame.clear_white();
+                draw_chrome(&mut frame);
                 frame.flush(&mut epd, Bank::Both)?;
                 log::info!("cleared in {}ms", epd.refresh(Refresh::Full)?);
                 load_stroke_lut(&mut epd)?;
-                for mask in masks.iter_mut() {
-                    mask.clear();
-                }
+                charge.clear();
                 covered.iter_mut().for_each(|area| *area = None);
                 partials = 0;
             }
@@ -217,9 +219,7 @@ fn try_run() -> anyhow::Result<()> {
                 frame.flush(&mut epd, Bank::Both)?;
                 log::info!("de-ghosted in {}ms", epd.refresh(Refresh::Full)?);
                 load_stroke_lut(&mut epd)?;
-                for mask in masks.iter_mut() {
-                    mask.clear();
-                }
+                charge.clear();
                 covered.iter_mut().for_each(|area| *area = None);
                 partials = 0;
             }
@@ -240,20 +240,7 @@ fn try_run() -> anyhow::Result<()> {
                     continue; // nothing on the canvas moved
                 };
                 if STROKES == Strokes::Hybrid {
-                    // The newest mask is what was just drawn and gets the strong
-                    // drive; the rest are still healing and get the weak one.
-                    let older: Vec<&[u8]> = masks
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != newest)
-                        .map(|(_, m)| m.as_bytes())
-                        .collect();
-                    epd.flush_graded_area(
-                        frame.as_bytes(),
-                        masks[newest].as_bytes(),
-                        &older,
-                        area,
-                    )?;
+                    epd.flush_charged_area(frame.as_bytes(), &mut charge, area)?;
                 } else {
                     frame.flush(&mut epd, Bank::Current)?;
                 }
@@ -264,10 +251,9 @@ fn try_run() -> anyhow::Result<()> {
                     area.size.height
                 );
                 partials += 1;
-                // Retire the oldest mask. Its pixels leave the drive set, so
-                // they have to be rewritten on the next pass.
+                // Retire the oldest box. Whatever it covered has now spent its
+                // last drive, so it no longer has to be rewritten.
                 newest = (newest + 1) % HEAL_PASSES;
-                masks[newest].clear();
                 covered[newest] = None;
             }
         }
@@ -311,17 +297,17 @@ fn apply(
     pen: &mut Option<Point>,
     ink: Ink,
     frame: &mut FrameBuffer,
-    mask: &mut Mask,
+    charge: &mut Charge,
 ) -> (Update, Option<Rectangle>) {
     // `FrameBuffer`'s draw error is Infallible, so none of these can fail.
     match ink {
         Ink::At(point) => {
+            let mut ink = InkTarget::new(frame, charge);
             let touched = match *pen {
                 Some(from) => {
                     let line = Line::new(from, point)
                         .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, STROKE_WIDTH));
-                    let _ = line.draw(frame);
-                    let _ = line.draw(mask);
+                    let _ = line.draw(&mut ink);
                     line.bounding_box()
                 }
                 // Pen-down: a stroke that is only one point long still has to
@@ -329,22 +315,24 @@ fn apply(
                 None => {
                     let dot = Circle::with_center(point, STROKE_WIDTH)
                         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On));
-                    let _ = dot.draw(frame);
-                    let _ = dot.draw(mask);
+                    let _ = dot.draw(&mut ink);
                     dot.bounding_box()
                 }
             };
+            // If the stroke only crossed ink that was already there, nothing
+            // changed and there is nothing to refresh.
+            let touched = ink.changed.then_some(touched);
             *pen = Some(point);
-            (Update::Drawn, Some(touched))
+            (Update::Drawn, touched)
         }
         Ink::Lifted => {
             *pen = None;
             (Update::Lifted, None)
         }
         Ink::Clear => {
+            // The canvas is wiped by the render loop, not here: the image about
+            // to be erased is needed first, to cancel its charge.
             *pen = None;
-            frame.clear_white();
-            draw_chrome(frame);
             (Update::Cleared, None)
         }
     }

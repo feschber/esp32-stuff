@@ -114,6 +114,23 @@ pub enum Bank {
 /// Measured: the panel runs the LUT at
 /// 19.65ms per frame, so a refresh costs `frames * 19.65ms`, plus 218ms if the
 /// rails have to be raised and dropped around it.
+/// Border waveform source (0x3C): bits 7:6 pick the source (00 GS transition,
+/// 01 fix level, 10 VCOM, 11 high impedance) and bits 5:4 the level for a fixed
+/// one (00 VSS, 01 VSH1, 10 VSL, 11 VSH2).
+///
+/// The border is a single large electrode that no erase cycle ever relieves, so
+/// anything that drives it one way on every refresh biases it for good. Pinning
+/// it to a fixed level held it white but did exactly that; the vendor's default
+/// of following LUT1 is balanced but drifts to grey, because it takes a partial
+/// transition on every refresh.
+///
+/// Doing both, by source, avoids each problem: driven only on a full refresh,
+/// where LUT1 gives it a balanced swing that ends white, and left at high
+/// impedance the rest of the time, where it accumulates nothing and stays white
+/// because the film is bistable.
+const BORDER_FULL: u8 = 0x01;
+const BORDER_PARTIAL: u8 = 0xC0;
+
 const VSS: u8 = 0b00;
 const VSH1: u8 = 0b01;
 const VSL: u8 = 0b10;
@@ -347,6 +364,14 @@ impl<'d> Epd<'d> {
             ),
         };
 
+        self.write(
+            Cmd::BorderWaveform,
+            &[if mode == Refresh::Full {
+                BORDER_FULL
+            } else {
+                BORDER_PARTIAL
+            }],
+        )?;
         self.write(Cmd::UpdateControl1, &red)?;
         self.write(Cmd::WriteVcom, &[0x48])?;
         self.write(Cmd::UpdateControl2, &[sequence])?;
@@ -432,22 +457,6 @@ impl<'d> Epd<'d> {
     /// Use [`Epd::flush_with_drive`] to choose which pixels count as
     /// transitions.
     #[allow(dead_code)] // superseded by load_graded_lut; kept for comparison
-    pub fn load_hybrid_lut(&mut self, frames: u8) -> Result<(), EspError> {
-        let mut ws = [0u8; 105];
-        ws[0] = phases(VSS, VSS, VSS, VSS); // LUT0: held
-        ws[10] = phases(VSL, VSS, VSS, VSS); // LUT1: driven white
-        ws[20] = phases(VSH1, VSS, VSS, VSS); // LUT2: driven black
-        ws[30] = phases(VSS, VSS, VSS, VSS); // LUT3: held
-        ws[50..55].copy_from_slice(&[frames, 0, 0, 0, 0]);
-        ws[100..105].fill(0x22);
-
-        self.write(Cmd::WriteLut, &ws)?;
-        self.wait_while_busy("load lut", RESET_TIMEOUT_MS)?;
-        self.write(Cmd::GateDrivingVoltage, &[0x17])?;
-        self.write(Cmd::SourceDrivingVoltage, &[0x41, 0xA8, 0x32])?;
-        self.write(Cmd::WriteVcom, &[0x48])
-    }
-
     /// Writes both image banks so that each pixel lands in the LUT slot we
     /// want: `target` becomes the current image and `target ^ drive` the
     /// previous one.
@@ -459,26 +468,6 @@ impl<'d> Epd<'d> {
     /// pass and give a pixel a bounded number of drives without needing a
     /// per-pixel counter.
     #[allow(dead_code)] // the area variant covers the whole screen if asked
-    pub fn flush_with_drive(&mut self, target: &[u8], drive: &[&[u8]]) -> Result<(), EspError> {
-        self.write_ram(Cmd::WriteRamCurrent, target, 0, 0, WIDTH, HEIGHT)?;
-
-        self.set_window(0, 0, WIDTH, HEIGHT)?;
-        self.command(Cmd::WriteRamPrevious)?;
-        self.dc.set_high()?;
-        self.cs.set_low()?;
-        let mut row = [0u8; ROW_BYTES];
-        let result = (0..HEIGHT as usize).try_for_each(|line| {
-            let at = line * ROW_BYTES;
-            for (i, byte) in row.iter_mut().enumerate() {
-                let driven = drive.iter().fold(0u8, |acc, mask| acc | mask[at + i]);
-                *byte = target[at + i] ^ driven;
-            }
-            self.spi.write(&row)
-        });
-        self.cs.set_high()?;
-        result
-    }
-
     /// As [`Epd::flush_with_drive`], but writes only `area` of each bank.
     ///
     /// `area` is in screen coordinates and is rounded outward to whole bytes in
@@ -487,52 +476,6 @@ impl<'d> Epd<'d> {
     /// is a slice out of the middle of a framebuffer row -- hence the explicit
     /// stride rather than reusing [`Epd::draw`].
     #[allow(dead_code)] // the graded variant is what the demo uses
-    pub fn flush_with_drive_area(
-        &mut self,
-        target: &[u8],
-        drive: &[&[u8]],
-        area: Rectangle,
-    ) -> Result<(), EspError> {
-        let Some(corner) = area.bottom_right() else {
-            return Ok(());
-        };
-        let x0 = area.top_left.x.clamp(0, SCREEN_WIDTH as i32 - 1) as u16;
-        let x1 = (corner.x + 1).clamp(0, SCREEN_WIDTH as i32) as u16;
-        let y0 = (area.top_left.y.clamp(0, SCREEN_HEIGHT as i32 - 1) as u16) & !7;
-        let y1 = (((corner.y + 1).clamp(0, SCREEN_HEIGHT as i32) as u16) + 7) & !7;
-        if x1 <= x0 || y1 <= y0 {
-            return Ok(());
-        }
-
-        let first = (y0 / 8) as usize;
-        let len = ((y1 - y0) / 8) as usize;
-
-        for (cmd, xor) in [(Cmd::WriteRamCurrent, false), (Cmd::WriteRamPrevious, true)] {
-            // Native x is the screen's y, native y the screen's x.
-            self.set_window(y0, x0, y1 - y0, x1 - x0)?;
-            self.command(cmd)?;
-            self.dc.set_high()?;
-            self.cs.set_low()?;
-            let mut row = [0u8; ROW_BYTES];
-            let result = (x0..x1).try_for_each(|screen_x| {
-                let at = screen_x as usize * ROW_BYTES + first;
-                let line = &target[at..at + len];
-                if !xor {
-                    self.spi.write(line)
-                } else {
-                    for (i, byte) in row[..len].iter_mut().enumerate() {
-                        let driven = drive.iter().fold(0u8, |acc, mask| acc | mask[at + i]);
-                        *byte = line[i] ^ driven;
-                    }
-                    self.spi.write(&row[..len])
-                }
-            });
-            self.cs.set_high()?;
-            result?;
-        }
-        Ok(())
-    }
-
     /// A waveform with two strengths of drive towards black, so a stroke can be
     /// taken most of the way in the pass it is drawn and only topped up after.
     ///
@@ -581,11 +524,18 @@ impl<'d> Epd<'d> {
     ///
     /// A pixel drawn again while still healing must count as fresh only --
     /// flipping both banks would land it back on a held slot.
-    pub fn flush_graded_area(
+    /// Writes `area` of both banks from `target` and the drive counts in
+    /// `charge`, then spends one drive from every pixel in the region.
+    ///
+    /// A pixel on its first pass goes to LUT2 for the strong drive, one still
+    /// being topped up to LUT1 for the weak one, and one with nothing left is
+    /// held. Same symmetric encoding as before: flipping a pixel in the previous
+    /// bank presents `(white, black)`, flipping it in the current bank presents
+    /// `(black, white)`.
+    pub fn flush_charged_area(
         &mut self,
         target: &[u8],
-        fresh: &[u8],
-        older: &[&[u8]],
+        charge: &mut Charge,
         area: Rectangle,
     ) -> Result<(), EspError> {
         let Some(corner) = area.bottom_right() else {
@@ -601,7 +551,7 @@ impl<'d> Epd<'d> {
         let first = (y0 / 8) as usize;
         let len = ((y1 - y0) / 8) as usize;
 
-        for (cmd, use_fresh) in [(Cmd::WriteRamCurrent, false), (Cmd::WriteRamPrevious, true)] {
+        for (cmd, strong_bank) in [(Cmd::WriteRamCurrent, false), (Cmd::WriteRamPrevious, true)] {
             self.set_window(y0, x0, y1 - y0, x1 - x0)?;
             self.command(cmd)?;
             self.dc.set_high()?;
@@ -610,20 +560,59 @@ impl<'d> Epd<'d> {
             let result = (x0..x1).try_for_each(|screen_x| {
                 let at = screen_x as usize * ROW_BYTES + first;
                 for (i, byte) in row[..len].iter_mut().enumerate() {
-                    let f = fresh[at + i];
-                    let flip = if use_fresh {
-                        f
-                    } else {
-                        older.iter().fold(0u8, |acc, m| acc | m[at + i]) & !f
-                    };
-                    *byte = target[at + i] ^ flip;
+                    let (strong, weak) = charge.masks(screen_x, first + i);
+                    *byte = target[at + i] ^ if strong_bank { strong } else { weak };
                 }
                 self.spi.write(&row[..len])
             });
             self.cs.set_high()?;
             result?;
         }
+
+        for screen_x in x0..x1 {
+            for i in 0..len {
+                charge.decay(screen_x, first + i);
+            }
+        }
         Ok(())
+    }
+
+    /// Drives every pixel that is currently black towards white for `frames`,
+    /// to cancel the one-directional charge the drawing path put into it.
+    ///
+    /// The drawing path only ever pushes towards black, and a full refresh is
+    /// net zero, so without this a pixel keeps whatever bias it accumulated for
+    /// good. Run it just before clearing, with `ink` being the image about to be
+    /// wiped and `frames` the total the drawing path spent darkening a pixel.
+    ///
+    /// Needs no masks: putting the old image in the previous bank and blank
+    /// paper in the current one puts exactly the inked pixels into LUT1, which
+    /// here is the only slot that drives.
+    pub fn balance_to_white(&mut self, ink: &[u8], frames: u8) -> Result<u32, EspError> {
+        let mut ws = [0u8; 105];
+        ws[0] = phases(VSS, VSS, VSS, VSS); // LUT0: held
+        ws[10] = phases(VSL, VSS, VSS, VSS); // LUT1: black -> white, drives
+        ws[20] = phases(VSS, VSS, VSS, VSS); // LUT2: held
+        ws[30] = phases(VSS, VSS, VSS, VSS); // LUT3: held
+        ws[50..55].copy_from_slice(&[frames, 0, 0, 0, 0]);
+        ws[100..105].fill(0x22);
+        self.write(Cmd::WriteLut, &ws)?;
+        self.wait_while_busy("load lut", RESET_TIMEOUT_MS)?;
+        self.write(Cmd::GateDrivingVoltage, &[0x17])?;
+        self.write(Cmd::SourceDrivingVoltage, &[0x41, 0xA8, 0x32])?;
+        self.write(Cmd::WriteVcom, &[0x48])?;
+
+        self.write_ram(Cmd::WriteRamPrevious, ink, 0, 0, WIDTH, HEIGHT)?;
+        self.set_window(0, 0, WIDTH, HEIGHT)?;
+        self.command(Cmd::WriteRamCurrent)?;
+        let row = [0xFFu8; ROW_BYTES];
+        self.dc.set_high()?;
+        self.cs.set_low()?;
+        let result = (0..HEIGHT).try_for_each(|_| self.spi.write(&row));
+        self.cs.set_high()?;
+        result?;
+
+        self.refresh(Refresh::PartialHybrid)
     }
 
     /// Sets the border waveform register (0x3C). Takes effect on the next
@@ -799,6 +788,11 @@ impl FrameBuffer {
         &self.data
     }
 
+    /// True where the canvas already holds ink.
+    fn is_black(&self, x: u16, y: u16) -> bool {
+        self.data[x as usize * ROW_BYTES + y as usize / 8] & (0x80 >> (y % 8)) == 0
+    }
+
     /// Writes the whole buffer into controller memory. Follow with
     /// [`Epd::refresh`].
     pub fn flush(&self, epd: &mut Epd<'_>, bank: Bank) -> Result<(), EspError> {
@@ -821,47 +815,152 @@ impl FrameBuffer {
     }
 }
 
-/// A set of pixels to drive on the next refresh, in the same layout as
-/// [`FrameBuffer`] so it can be handed straight to [`Epd::flush_with_drive`].
-/// Drawing [`BinaryColor::On`] marks a pixel for driving.
-pub struct Mask {
+/// How many more passes a freshly drawn pixel is driven for. Two bits per
+/// pixel, so at most 3.
+pub const MAX_CHARGE: u8 = 3;
+
+/// Bytes per row of [`Charge`]: two bits a pixel, so twice a framebuffer row.
+const CHARGE_ROW_BYTES: usize = ROW_BYTES * 2;
+
+/// How many drives each pixel still has coming, two bits each.
+///
+/// This replaces what used to be a ring of one full drive mask per healing pass
+/// -- three 48KB bitmaps storing, between them, a number from 0 to 3. Holding
+/// that number directly costs 96KB instead of 144KB, scales far better (three
+/// bits would give seven passes for what a ring spends on three), and lets a
+/// pixel drawn again mid-heal simply reset its count instead of needing a rule
+/// about which mask wins.
+///
+/// Drawing [`BinaryColor::On`] charges a pixel fully.
+pub struct Charge {
     data: Box<[u8]>,
 }
 
-impl Mask {
+impl Charge {
     pub fn new() -> Self {
         Self {
-            data: vec![0x00; IMAGE_BYTES].into_boxed_slice(),
+            data: vec![0u8; CHARGE_ROW_BYTES * SCREEN_WIDTH as usize].into_boxed_slice(),
         }
     }
 
     pub fn clear(&mut self) {
-        self.data.fill(0x00);
+        self.data.fill(0);
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+    fn at(row: u16, byte: usize) -> usize {
+        row as usize * CHARGE_ROW_BYTES + byte * 2
     }
 
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.data.iter().all(|byte| *byte == 0)
+    /// The eight pixels of framebuffer byte `(row, byte)`, split into those on
+    /// their first drive and those merely being topped up.
+    fn masks(&self, row: u16, byte: usize) -> (u8, u8) {
+        let at = Self::at(row, byte);
+        let (mut strong, mut weak) = (0u8, 0u8);
+        for bit in 0..8usize {
+            let count = (self.data[at + bit / 4] >> ((bit % 4) * 2)) & 0b11;
+            if count == MAX_CHARGE {
+                strong |= 0x80 >> bit;
+            } else if count > 0 {
+                weak |= 0x80 >> bit;
+            }
+        }
+        (strong, weak)
+    }
+
+    /// Spends one drive from each of those eight pixels.
+    fn charge_pixel(&mut self, x: u16, y: u16) {
+        let at = Self::at(x, y as usize / 8) + (y as usize % 8) / 4;
+        let shift = (y % 4) * 2;
+        self.data[at] = (self.data[at] & !(0b11 << shift)) | (MAX_CHARGE << shift);
+    }
+
+    fn decay(&mut self, row: u16, byte: usize) {
+        let at = Self::at(row, byte);
+        for half in 0..2 {
+            let mut packed = self.data[at + half];
+            if packed == 0 {
+                continue;
+            }
+            for slot in 0..4 {
+                let shift = slot * 2;
+                let count = (packed >> shift) & 0b11;
+                if count > 0 {
+                    packed = (packed & !(0b11 << shift)) | ((count - 1) << shift);
+                }
+            }
+            self.data[at + half] = packed;
+        }
     }
 }
 
-impl Default for Mask {
-    fn default() -> Self {
-        Self::new()
+/// Lays ink onto the canvas, charging only the pixels that actually change.
+///
+/// A stroke crossing ink that is already black costs nothing: those pixels are
+/// where they should be, so driving them again is bias with no optical effect.
+/// This is what keeps a pixel's charge bounded by its transitions rather than by
+/// how often it happens to be drawn over.
+pub struct InkTarget<'a> {
+    frame: &'a mut FrameBuffer,
+    charge: &'a mut Charge,
+    /// Whether anything actually turned black.
+    pub changed: bool,
+}
+
+impl<'a> InkTarget<'a> {
+    pub fn new(frame: &'a mut FrameBuffer, charge: &'a mut Charge) -> Self {
+        Self {
+            frame,
+            charge,
+            changed: false,
+        }
     }
 }
 
-impl OriginDimensions for Mask {
+impl OriginDimensions for InkTarget<'_> {
     fn size(&self) -> Size {
         Size::new(SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32)
     }
 }
 
-impl DrawTarget for Mask {
+impl DrawTarget for InkTarget<'_> {
+    type Color = BinaryColor;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(point, color) in pixels {
+            if !color.is_on() {
+                continue;
+            }
+            let (Ok(x), Ok(y)) = (u16::try_from(point.x), u16::try_from(point.y)) else {
+                continue;
+            };
+            if x >= SCREEN_WIDTH || y >= SCREEN_HEIGHT || self.frame.is_black(x, y) {
+                continue;
+            }
+            self.frame.set_pixel(x, y, true);
+            self.charge.charge_pixel(x, y);
+            self.changed = true;
+        }
+        Ok(())
+    }
+}
+
+impl Default for Charge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OriginDimensions for Charge {
+    fn size(&self) -> Size {
+        Size::new(SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32)
+    }
+}
+
+impl DrawTarget for Charge {
     type Color = BinaryColor;
     type Error = core::convert::Infallible;
 
@@ -875,7 +974,9 @@ impl DrawTarget for Mask {
             }
             if let (Ok(x), Ok(y)) = (u16::try_from(point.x), u16::try_from(point.y)) {
                 if x < SCREEN_WIDTH && y < SCREEN_HEIGHT {
-                    self.data[x as usize * ROW_BYTES + y as usize / 8] |= 0x80 >> (y % 8);
+                    let at = Self::at(x, y as usize / 8) + (y as usize % 8) / 4;
+                    let shift = (y % 4) * 2;
+                    self.data[at] = (self.data[at] & !(0b11 << shift)) | (MAX_CHARGE << shift);
                 }
             }
         }

@@ -33,7 +33,7 @@ const CHIP_ID_FT6336U: u8 = 0x64;
 
 /// `0x80`: how hard a press has to be before it counts. Lower is more
 /// sensitive, at the cost of picking up noise. The vendor driver uses 22.
-const TOUCH_THRESHOLD: u8 = 22;
+const TOUCH_THRESHOLD: u8 = 12;
 
 /// `0x85`: an exponential smoothing filter on the reported coordinate, and it
 /// weights the *old* sample -- so higher means more smoothing and more lag.
