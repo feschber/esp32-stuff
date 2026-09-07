@@ -21,7 +21,7 @@ use esp_idf_svc::hal::{delay::FreeRtos, gpio::InputPin, prelude::Peripherals};
 use std::{sync::mpsc, thread, time::Duration};
 
 use crate::{
-    ft6336::{Ft6336, Touch},
+    ft6336::{Event, Ft6336, Touch},
     gdeq0426t82::{Bank, Charge, Epd, FrameBuffer, InkTarget, Refresh, MAX_CHARGE, SCREEN_WIDTH},
 };
 
@@ -59,6 +59,11 @@ enum Strokes {
 }
 
 const STROKES: Strokes = Strokes::Hybrid;
+
+/// Emit one line per touch report for `tools/touchview.py` to plot. Kept short
+/// on purpose: at ~110 reports a second, a long line costs enough serial time to
+/// pace the poll loop and distort what it is meant to be measuring.
+const LOG_TOUCHES: bool = true;
 
 /// Frames a pixel is driven for on each pass it is presented as a transition.
 /// Total convergence is `HYBRID_FRAMES * HEAL_PASSES`, so spreading a small
@@ -356,6 +361,7 @@ fn draw_chrome(frame: &mut FrameBuffer) {
 }
 
 fn poll_touch<INT: InputPin>(mut touch: Ft6336<'static, INT>, ink: &mpsc::Sender<Ink>) {
+    let mut logged: Option<(u16, u16)> = None;
     let mut was_down = false;
     // Set when a stroke began on the clear button, so that dragging off it does
     // not leave a trail behind.
@@ -369,6 +375,32 @@ fn poll_touch<INT: InputPin>(mut touch: Ft6336<'static, INT>, ink: &mpsc::Sender
                 Vec::new()
             }
         };
+
+        if LOG_TOUCHES {
+            match touches.first() {
+                Some(t) => {
+                    if Some((t.x, t.y)) != logged {
+                        let (x, y, w, a, id, ev, n) =
+                            (t.x, t.y, t.weight, t.area, t.id, t.event as u8, touches.len());
+                        // `println!` rather than `log::info!`: the log prefix is
+                        // ~28 bytes, which at 110 reports a second is half the
+                        // serial budget on its own.
+                        let raw: String = touch.last_raw()[1..7]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        println!("TCH {x} {y} {w} {a} {id} {ev} {n} {raw}");
+                        logged = Some((t.x, t.y));
+                    }
+                }
+                None => {
+                    if logged.is_some() {
+                        log::info!("TCH up");
+                        logged = None;
+                    }
+                }
+            }
+        }
 
         let point = touches.first().map(screen_point);
         let is_down = point.is_some();

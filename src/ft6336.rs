@@ -10,7 +10,11 @@
 //! controller resets on power-up anyway.
 
 use esp_idf_svc::hal::{
-    delay::TickType, gpio::*, i2c::*, peripheral::Peripheral, units::FromValueType,
+    delay::{Ets, TickType},
+    gpio::*,
+    i2c::*,
+    peripheral::Peripheral,
+    units::FromValueType,
 };
 use esp_idf_sys::EspError;
 
@@ -84,6 +88,29 @@ const SCAN_PERIOD_MS: u8 = 10;
 /// [`STAY_ACTIVE`] is 1. Chip default 40.
 const MONITOR_PERIOD_MS: u8 = 40;
 
+/// `DEVICE_MODE` bits 6:4 select which register map is live. The whole address
+/// space changes meaning: `0x02` is TD_STATUS in operating mode and START_SCAN
+/// in test mode, so the two cannot be used at once.
+const TEST_MODE: u8 = 0b100 << 4;
+
+/// Test-mode register addresses, which deliberately overlap the operating-mode
+/// ones above.
+mod test_reg {
+    pub const DEVICE_MODE: u8 = 0x00;
+    pub const ROW_ADDR: u8 = 0x01;
+    pub const START_SCAN: u8 = 0x02;
+    pub const ROW_NUM: u8 = 0x03;
+    pub const COL_NUM: u8 = 0x04;
+    pub const DRIVER_VOL: u8 = 0x05;
+    pub const GAIN: u8 = 0x07;
+    pub const RES_WH: u8 = 0x0C;
+    pub const RAWDATA: u8 = 0x10;
+}
+
+/// Raw values the register map has room for per row. Anything past the real
+/// column count reads back as 0xFFFF.
+const RAW_COLUMNS: usize = 30;
+
 #[repr(u8)]
 #[derive(Clone, Copy)]
 enum Reg {
@@ -111,8 +138,8 @@ enum Reg {
 
 /// The transition a point reports, from the top two bits of its x high byte.
 /// A point that is lifting or absent carries stale coordinates.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Event {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
     PressDown,
     LiftUp,
     Contact,
@@ -142,6 +169,12 @@ pub struct Touch {
     pub y: u16,
     /// Finger id, stable while that finger stays down.
     pub id: u8,
+    /// Contact pressure, as the controller judges it.
+    pub weight: u8,
+    /// Contact size. Large values are a palm or a cheek rather than a fingertip,
+    /// which is what makes it worth rejecting on.
+    pub area: u8,
+    pub event: Event,
 }
 
 /// The burst read in [`Ft6336::read`] assumes the point blocks sit directly
@@ -150,6 +183,9 @@ const _: () = assert!(Reg::Touch1 as u8 == Reg::NumTouches as u8 + 1);
 
 pub struct Ft6336<'d, INT: InputPin> {
     i2c: I2cDriver<'d>,
+    /// The last burst read, kept so a caller can see the bytes the chip
+    /// actually sent rather than only our reading of them.
+    last_raw: [u8; 1 + MAX_TOUCHES * POINT_BYTES],
     /// Held to keep the pin reserved even when nothing reads it; see
     /// [`Ft6336::is_touched`].
     #[allow(dead_code)]
@@ -167,7 +203,11 @@ impl<'d, INT: InputPin> Ft6336<'d, INT> {
     ) -> Result<Self, EspError> {
         let i2c = I2cDriver::new(i2c, sda, scl, &I2cConfig::new().baudrate(400.kHz().into()))?;
         let int = PinDriver::input(int)?;
-        let mut touch = Self { i2c, int };
+        let mut touch = Self {
+            i2c,
+            int,
+            last_raw: [0; 1 + MAX_TOUCHES * POINT_BYTES],
+        };
 
         let chip_id = touch.read_reg(Reg::ChipId)?;
         if chip_id != CHIP_ID_FT6336U {
@@ -219,6 +259,12 @@ impl<'d, INT: InputPin> Ft6336<'d, INT> {
         self.write_reg(Reg::CoordThreshold, value)
     }
 
+    /// The bytes behind the most recent [`Ft6336::read`]: status, then one
+    /// six-byte block per point.
+    pub fn last_raw(&self) -> &[u8] {
+        &self.last_raw
+    }
+
     /// True while the interrupt line is asserted, i.e. there is something to
     /// read. Only meaningful because [`Ft6336::new`] puts the controller in
     /// polling mode; in its power-on trigger mode the line only pulses.
@@ -237,11 +283,13 @@ impl<'d, INT: InputPin> Ft6336<'d, INT> {
         // One burst covers the status byte and every point block behind it.
         let mut buf = [0u8; 1 + MAX_TOUCHES * POINT_BYTES];
         self.read_regs(Reg::NumTouches, &mut buf)?;
+        self.last_raw = buf;
         let reported = usize::from(buf[0] & 0x0F).min(MAX_TOUCHES);
 
         let mut touches = Vec::with_capacity(reported);
         for point in buf[1..].chunks_exact(POINT_BYTES).take(reported) {
-            if !Event::from_x_high(point[0]).is_down() {
+            let event = Event::from_x_high(point[0]);
+            if !event.is_down() {
                 continue;
             }
             // The high bytes carry the event and the finger id in their top
@@ -250,9 +298,111 @@ impl<'d, INT: InputPin> Ft6336<'d, INT> {
                 x: u16::from(point[0] & 0x0F) << 8 | u16::from(point[1]),
                 y: u16::from(point[2] & 0x0F) << 8 | u16::from(point[3]),
                 id: point[2] >> 4,
+                // The last two bytes of the block, which we used to discard.
+                weight: point[4],
+                area: point[5] >> 4,
+                event,
             });
         }
         Ok(touches)
+    }
+
+    /// Switches into the controller's raw-data test mode, dumps one frame of
+    /// sensor values, and switches back.
+    ///
+    /// Both test modes are marked "(Reserved)" in FocalTech's own note, and that
+    /// note documents the whole CTPM family rather than this part, so treat what
+    /// comes back as evidence rather than as a contract. Values past the real
+    /// column count read as 0xFFFF, which is what tells us the true geometry.
+    #[allow(dead_code)] // manual diagnostic; the FT6336U does not implement it
+    pub fn dump_raw(&mut self) -> Result<(), EspError> {
+        // Is the test-mode map actually live, or are we reading reserved
+        // addresses of the operating-mode one? Compare the low registers before
+        // and after the switch, and check whether a test-mode register that
+        // should be writable holds what we put in it.
+        let mut before = [0u8; 16];
+        self.read_burst(0x00, &mut before)?;
+
+        self.write_at(test_reg::DEVICE_MODE, TEST_MODE)?;
+        Ets::delay_us(2000);
+
+        let mut after = [0u8; 16];
+        self.read_burst(0x00, &mut after)?;
+        log::info!("raw: 0x00..0x0F operating {before:02X?}");
+        log::info!("raw: 0x00..0x0F test      {after:02X?}");
+
+        self.write_at(test_reg::ROW_ADDR, 5)?;
+        self.write_at(test_reg::START_SCAN, 1)?;
+        Ets::delay_us(500);
+        log::info!(
+            "raw: wrote ROW_ADDR=5 -> reads {}, START_SCAN=1 -> reads {}",
+            self.read_at(test_reg::ROW_ADDR)?,
+            self.read_at(test_reg::START_SCAN)?,
+        );
+
+        let mode = self.read_at(test_reg::DEVICE_MODE)?;
+        let rows = self.read_at(test_reg::ROW_NUM)?;
+        let cols = self.read_at(test_reg::COL_NUM)?;
+        let mut res = [0u8; 4];
+        self.read_burst(test_reg::RES_WH, &mut res)?;
+        log::info!(
+            "raw: mode {mode:#04x}, rows {rows}, cols {cols}, res {}x{}, driver_vol {}, gain {}",
+            u16::from_be_bytes([res[0], res[1]]),
+            u16::from_be_bytes([res[2], res[3]]),
+            self.read_at(test_reg::DRIVER_VOL)?,
+            self.read_at(test_reg::GAIN)?,
+        );
+
+        let started = unsafe { esp_idf_sys::esp_timer_get_time() };
+        // START_SCAN clears itself once the scan completes.
+        self.write_at(test_reg::START_SCAN, 1)?;
+        let mut waited = 0;
+        while waited < 200 && self.read_at(test_reg::START_SCAN)? != 0 {
+            Ets::delay_us(200);
+            waited += 1;
+        }
+
+        for row in 0..rows.clamp(1, 40) {
+            self.write_at(test_reg::ROW_ADDR, row)?;
+            Ets::delay_us(200); // the note asks for more than 100us
+            let mut buf = [0u8; RAW_COLUMNS * 2];
+            self.read_burst(test_reg::RAWDATA, &mut buf)?;
+            let values: Vec<String> = buf
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .map(|v| if v == 0xFFFF { "   -".into() } else { format!("{v:4}") })
+                .collect();
+            log::info!("raw {row:2}: {}", values.join(" "));
+        }
+        let took = (unsafe { esp_idf_sys::esp_timer_get_time() } - started) / 1000;
+        log::info!("raw: scan waited {}us, whole frame {took}ms", waited * 200);
+
+        self.write_at(test_reg::DEVICE_MODE, 0)?;
+        Ets::delay_us(2000);
+        Ok(())
+    }
+
+    fn read_at(&mut self, addr: u8) -> Result<u8, EspError> {
+        let mut buf = [0u8; 1];
+        self.read_burst(addr, &mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn read_burst(&mut self, addr: u8, buf: &mut [u8]) -> Result<(), EspError> {
+        self.i2c.write_read(
+            ADDR,
+            &[addr],
+            buf,
+            TickType::new_millis(I2C_TIMEOUT_MS).into(),
+        )
+    }
+
+    fn write_at(&mut self, addr: u8, value: u8) -> Result<(), EspError> {
+        self.i2c.write(
+            ADDR,
+            &[addr, value],
+            TickType::new_millis(I2C_TIMEOUT_MS).into(),
+        )
     }
 
     fn read_reg(&mut self, reg: Reg) -> Result<u8, EspError> {
